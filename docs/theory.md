@@ -20,6 +20,11 @@ filesync copies a source directory to a destination — typically **removable / 
    hours. Among designs that satisfy (1) and (2), we pick the fastest, and we work hard to avoid
    unnecessary work. Speed never overrides reliability or robustness.
 
+**Usage model.** A large sync can run for a night or a weekend, so filesync runs **unattended — no
+interactive prompts** — and is resumable. The user does one of two things: run `sync` (do the job)
+or run `diff` (preview the job / find discrepancies). To "check before acting," run `diff` first;
+there is deliberately no confirmation prompt in `sync`.
+
 ### Why writes are the thing to avoid
 
 On the target media — USB flash, spinning and SATA drives — **writing is the slow, expensive
@@ -115,6 +120,32 @@ for someone who wants every-file-durable-as-it-goes; `--no-verify` to skip the c
   instead of re-copying — the single biggest speed and wear win.
 - These are why writing is minimized to exactly what's necessary — the raison d'être of the tool.
 
+#### Move detection — the algorithm (core, always on — not a flag)
+
+Terms: an **add** is a file Source has that Destination lacks (would be copied); an **extra** is a
+file Destination has that Source lacks (mirror would delete it). A **move** is an `add` whose
+identical content already exists as an `extra` — so instead of copy-then-delete we **`rename` it in
+place on the Destination**: no transfer, no write, no flash wear. Steps 1–4 are the `diff`/plan;
+`sync` executes step 5.
+
+1. **Scan** Source and Destination into in-memory manifests (relative path, size, mtime, type).
+2. **Classify by path:** in both & same (skip) / in both & differ (update) / Source-only (**add**) /
+   Destination-only (**extra**).
+3. **Cross-reference `add` × `extra` by content:**
+   - group `extra` files by **size** — a cheap pre-filter, since only equal-size files can be
+     identical, so we hash *only genuine candidates, never the whole tree*;
+   - for each `add` with a same-size `extra`, blake3-hash both. Computing the hash reads every byte,
+     so a match is a true content check (collision odds ~2⁻²⁵⁶), not a name check;
+   - match → **move**: plan `rename(dest/old → dest/new)` and drop the pair from `add`/`extra`;
+   - size collision but different content → leave as a normal `add` + `extra`.
+4. **Plan** = moves (renames) + remaining extras (deletes) + adds (copies) + changed (updates).
+5. **Execute** destructive/space-freeing first (renames + deletes), then copies/updates, then verify.
+   Moves are verified-by-construction (content was confirmed in step 3).
+
+Cost/benefit: we spend a Destination read + a Source read on each size-matched candidate to avoid a
+full Destination **write** — and writes are the slow, wearing operation (findings 1 & 3). The extra
+work is bounded to size-collision candidates, never the whole tree.
+
 ### Robust procedure (aim 2)
 
 - **Source is strictly read-only** — enforced at compile time via distinct `SrcRoot`/`DstRoot`
@@ -124,11 +155,13 @@ for someone who wants every-file-durable-as-it-goes; `--no-verify` to skip the c
   never leave a half-written file masquerading as real.
 - **Interruption-safe & resumable** — because each file is atomic and the manifest is recomputed,
   a re-run simply re-copies whatever didn't land; stray temp files are swept.
-- **Mirror with early, confirmed deletes** — the destination mirrors the source (no stale extras);
-  deletions run *early* to free space on tight targets, but only behind a preview + confirmation
-  gate, and never against the source.
-- **`--checksum`** opt-in for a paranoid content-verified skip decision (default is the fast
-  size+mtime quick-check, with tolerance for coarse FAT/exFAT timestamps).
+- **Mirror with early deletes** — the destination mirrors the source (no stale extras); deletions
+  run *early* to free space on tight targets, and never against the source. There is **no
+  interactive prompt** (filesync runs unattended) — preview with the `diff` command, and
+  `--backup-dir` makes deletions/overwrites recoverable.
+- **`--eager-checksum`** opt-in to compare by content hash instead of the default size+mtime
+  quick-check (with tolerance for coarse FAT/exFAT timestamps) — for a thorough check, or to never
+  miss a same-size+mtime change.
 
 ### Reliable end-result (aim 1)
 
@@ -144,7 +177,8 @@ give the operator complete visibility into what happened and what needs attentio
 - Correctness: **verify on by default** (`--no-verify` escape).
 - Efficiency: **skip-identical + move-as-rename**, identity by blake3 content hash.
 - Safety: **source read-only** (type-enforced), **atomic temp+rename**, resumable, mirror with
-  early confirmed deletes, `--checksum` opt-in.
+  early deletes (no prompts — preview via `diff`; `--backup-dir` for recoverable deletes),
+  `--eager-checksum` opt-in.
 - Manifest: **in-memory**, recomputed per run (no persisted tracking file).
 
 ## Next

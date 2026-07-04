@@ -1,131 +1,124 @@
-// TEMPORARILY DISABLED during the rebuild: tests.rs is the re-applied richer suite and
-// references APIs the current lib no longer exposes, so it won't compile. The test *corpus*
-// (creates_complicated_testing_tree etc.) is preserved for reuse; tests get reintroduced properly.
-// #[cfg(test)]
-// mod tests;
-mod structures;
-mod args_parse;
+//! filesync — cheaply and reliably mirror one directory onto another.
+//!
+//! See `README.md` for the CLI/UX and `docs/theory.md` for the design rationale and the
+//! benchmark data behind it.
+//!
+//! Pipeline: scan both trees → `diff` (classify + move-detect) → `plan` (ordered actions) →
+//! `apply` (renames/deletes/atomic copies → end-sync → verify) → `report`.
 
-pub use crate::args_parse::ProgramArgs;
+pub mod apply;
+pub mod cli;
+pub mod diff;
+pub mod hash;
+pub mod manifest;
+pub mod parallel;
+pub mod plan;
+pub mod report;
+pub mod scan;
+pub mod target;
 
-#[cfg(unix)]
-use crate::structures::ManifestEntry;
+pub use cli::{Cli, Command};
 
 use std::fs;
-use std::fs::{File, OpenOptions};
-use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
-use std::io::{Write, BufWriter};
-use crate::structures::Manifest;
+use std::process::ExitCode;
+use std::time::SystemTime;
 
-pub const TRACKING_FILENAME: &str = "filesync_tracking.txt";
+use manifest::{DstRoot, Kind, SrcRoot};
 
-pub fn run(args: ProgramArgs) -> String {
-    if let Some(dir) = args.track {
-        write_tracking_file_with_content(dir, args.prefix.as_deref())
-            .to_str().unwrap().to_string()
-    } else if let Some(files_pair) = args.diff {
-        let master = &files_pair[0];
-        let slave = &files_pair[1];
-        // ...
-        "".to_string()
-    } else if let Some(dirs) = args.sync {
-        let master = &dirs[0];
-        let slave = &dirs[1];
-        // ...
-        "".to_string()
-    } else {
-        unreachable!("clap ArgGroup enforces exactly one command");
+/// Program entry point, called from `main`.
+pub fn run(cli: Cli) -> ExitCode {
+    let common = cli.command.common();
+
+    if !common.from.is_dir() {
+        eprintln!("filesync: source is not a directory: {}", common.from.display());
+        return ExitCode::FAILURE;
     }
-}
-
-pub fn write_tracking_file(dir: impl AsRef<Path>) -> (PathBuf, File) {
-    let dir = dir.as_ref();
-
-    match fs::metadata(&dir) {
-        Ok(md) if md.is_dir() => {}
-        Ok(_) => panic!("not a directory: '{}'", dir.display()),
-        Err(e) => panic!("metadata failed for '{}': {e}", dir.display()),
+    if common.from == common.to {
+        eprintln!("filesync: --from and --to are the same directory");
+        return ExitCode::FAILURE;
     }
 
-    let file_path = dir.join(TRACKING_FILENAME);
+    let src = SrcRoot::new(&common.from);
+    let dst = DstRoot::new(&common.to);
 
-    match fs::symlink_metadata(&file_path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}  // doesn't exist: ok
-        Ok(m) if m.is_file() => {}                             // exists and is file: ok
-        Ok(_) => panic!("tracking path exists but is not a file: '{}'", file_path.display()),
-        Err(e) => panic!("metadata failed for '{}': {e}", file_path.display()),
-    }
-
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)  // for optionally reading from the same handle later
-        .write(true)  // for optionally writing with the same handle later
-        .open(&file_path)
-        .unwrap_or_else(|e| panic!("failed to create '{}': {e}", file_path.display()));
-
-    (file_path, file)
-}
-
-
-
-/// Walk directory
-fn discover_files(root: &Path, allowed_prefixes: Option<&[String]>) -> Manifest {
-    let root_str = root.to_str().unwrap();
-
-    let mut out: Manifest = WalkDir::new(root).follow_links(false).into_iter()
-        .filter_entry(|e| {
-            allowed_prefixes.is_none() || e.depth() == 0 || {  // depth 0 is root, which we don't want to stop at
-                allowed_prefixes.into_iter()
-                    .flatten()
-                    .map(|p| format!("{root_str}/{p}"))
-                    .any(|s| e.path().starts_with(s))
+    match &cli.command {
+        Command::Diff(a) => {
+            let src_m = scan::scan(src.path());
+            let dst_m = scan::scan(dst.path());
+            match diff::diff(&src, &src_m, &dst, &dst_m, a.common.eager_checksum, a.common.jobs) {
+                Ok(d) => {
+                    print!("{}", d.render());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("filesync diff: {e}");
+                    ExitCode::FAILURE
+                }
             }
-        })
-        .filter_map(|e| e.ok())  // ignore traversal errors for now
-        .filter(|e| e.depth() != 0)  // exclude root itself)
-        .map(|e| e.path().strip_prefix(root).unwrap().to_path_buf())
-        .filter(|rel| rel.as_os_str() != TRACKING_FILENAME)
-        .map(|rel| ManifestEntry::from_rel_path(root, rel))
-        .collect();
-
-    out.sort();
-    out
+        }
+        Command::Sync(a) => run_sync(&src, &dst, a),
+    }
 }
 
-
-
-pub fn write_tracking_file_with_content(dir: impl AsRef<Path>, allowed_prefix: Option<&[String]>) -> PathBuf {
-    let dir = dir.as_ref();
-    let (tracker_path, tracker_file) = write_tracking_file(dir);
-
-    let entries = discover_files(dir, allowed_prefix);
-
-    let data = Manifest::serialize(entries);
-    let mut w = BufWriter::new(tracker_file);  // buffered writing (smaller burden on RAM)
-    for d in data {
-        writeln!(w, "{}", d).unwrap_or_else(|err| panic!("failed to write to '{}': {err}", tracker_path.display()))
+fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> ExitCode {
+    if let Err(e) = fs::create_dir_all(dst.path()) {
+        eprintln!("filesync sync: cannot create destination {}: {e}", dst.path().display());
+        return ExitCode::FAILURE;
     }
 
-    tracker_path
+    // Clean up any temp files a previous, interrupted run left behind.
+    let swept = apply::sweep_temp_files(dst);
+    if swept > 0 {
+        eprintln!("filesync: removed {swept} leftover temp file(s) from a previous run");
+    }
+
+    let src_m = scan::scan(src.path());
+    let dst_m = scan::scan(dst.path());
+    let d = match diff::diff(src, &src_m, dst, &dst_m, a.common.eager_checksum, a.common.jobs) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("filesync sync: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let actions = plan::plan(&d);
+    let opts = apply::Options {
+        verify: !a.no_verify,
+        fsync_each: a.fsync_each,
+        backup_dir: a.backup_dir.clone(),
+        jobs: a.common.jobs,
+    };
+
+    // Open the (streamed) report; fall back to in-memory if the file can't be created.
+    let report_path = a
+        .common
+        .report
+        .clone()
+        .unwrap_or_else(|| report::default_report_path(src.path(), SystemTime::now()));
+    let mut report = report::Report::create(&report_path).unwrap_or_else(|e| {
+        eprintln!("filesync sync: cannot open report {} ({e}); continuing without a report file", report_path.display());
+        report::Report::new()
+    });
+
+    // Warn up front about destination limitations that will force skips.
+    let caps = target::probe(dst);
+    if !caps.symlinks {
+        let n = src_m.iter().filter(|e| e.kind == Kind::Symlink).count();
+        if n > 0 {
+            report.issue_msg(format!("destination cannot store symlinks; {n} will be skipped"));
+        }
+    }
+
+    apply::apply(src, dst, &actions, &opts, &mut report);
+    report.finish();
+
+    print!("{}", report.render());
+    println!("report: {}", report_path.display());
+
+    if report.issues.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
 }
-
-pub fn read_tracking_file_into_string(tracking_file: &std::path::Path) -> String {
-    std::fs::read_to_string(tracking_file)
-        .unwrap_or_else(|e| panic!("failed to read '{}': {e}", tracking_file.display()))
-}
-
-// pub fn read_tracking_file_into_manifest(tracking_file: &std::path::Path) -> Manifest {
-//     Manifest::deserialize_manifests(&read_tracking_file_into_string(&tracking_file))
-// }
-
-pub fn read_tracking_file_into_filepaths(tracking_file: &std::path::Path) -> Vec<String> {
-    let mut strings = read_tracking_file_into_string(&tracking_file).lines()
-        .map(|s| ManifestEntry::deserialize_path_key(&s))
-        .collect::<Vec<_>>();
-
-    // Escaped strings' order can differ after deserialization. Re-sorting might be necessary.
-    strings.sort_unstable();
-    strings
-}
-

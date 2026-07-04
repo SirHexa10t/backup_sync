@@ -1,32 +1,26 @@
-
 [package]
 name = "filesync"
 version = "0.1.0"
 edition = "2021"
-description = "Sync dir contents in an orderly manner"
+description = "Cheaply and reliably mirror one directory onto another"
 
 [dependencies]
 blake3 = "1.8.2"
-test-case = "3.3.1"
 walkdir = "2.5.0"
 clap = { version = "4.5.53", features = ["derive"] }
-os_str_bytes = { version = "7.1.1", features = ["conversions"] }
-serde_json = "1.0.148"
-base64 = "0.22.1"
-serde = { version = "1.0.228", features = ["derive"] }
 rayon = "1.11.0"
-unicode-width = "0.2.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2" # posix_fadvise(DONTNEED) for cold-read verification
 
 [dev-dependencies]
-test-case = "3.3.1"
-assert_cmd = "2.1.1"
-indicatif = "0.17" # progress bars for the usb_transfer benchmark (display only)
+tempfile = "3"
+indicatif = "0.17" # used by the usb_transfer benchmark
 
 # Removable-device transfer benchmark (WRITE / CHECKSUM / COPY, with fsync & verify variants).
 # Custom harness so it takes subcommands and can be run phase-by-phase to defeat the page cache.
-#   cargo bench --bench usb_transfer -- create A
+#   cargo bench --bench usb_transfer -- all <driveA> <driveB>
 [[bench]]
 name = "usb_transfer"
 path = "benchmarks/usb_transfer.rs"
 harness = false
-

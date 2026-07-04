@@ -1,7 +1,8 @@
-use clap::Parser;
-use filesync::{ProgramArgs, run};
+use std::process::ExitCode;
 
-fn main() {
-    let args = ProgramArgs::parse();
-    println!("{}", run(args));
+use clap::Parser;
+use filesync::Cli;
+
+fn main() -> ExitCode {
+    filesync::run(Cli::parse())
 }
