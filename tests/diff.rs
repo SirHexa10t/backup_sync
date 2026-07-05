@@ -171,6 +171,9 @@ fn kind_swap_is_delete_plus_add_not_change() {
     assert_eq!(r.removed_paths(), vec![PathBuf::from("x")], "dest file x is removed");
 }
 
+// The parallel move-detection path is dormant — the --jobs flag was removed; only the benchmark now
+// drives `parallel::map` with >1 workers. Test kept, commented, for revival alongside the flag.
+/*
 #[test]
 fn move_detection_is_correct_with_multiple_jobs() {
     let (s, d) = dirs();
@@ -187,3 +190,4 @@ fn move_detection_is_correct_with_multiple_jobs() {
     // parallel result matches the sequential one
     assert_eq!(run_diff_jobs(s.path(), d.path(), false, 1).moved.len(), 20);
 }
+*/

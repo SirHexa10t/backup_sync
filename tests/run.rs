@@ -18,7 +18,6 @@ fn mk_sync_cli(from: &Path, to: &Path, report: Option<PathBuf>, relative_symlink
                 to: to.to_path_buf(),
                 eager_checksum: false,
                 report,
-                jobs: 1,
             },
             no_verify: false,
             fsync_each: false,

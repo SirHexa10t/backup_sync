@@ -3,8 +3,8 @@
 //! **Only the destination is mutated** — every function that writes/deletes takes a [`DstRoot`], so
 //! a source path can't reach them (the type wall). Copies are **atomic** (write to a temp file,
 //! then `rename` into place), so an interruption never leaves a half-written real file. Durability
-//! is one end-of-run sync by default (or per-file with `fsync_each`), and each copied file is
-//! **verified** (re-read + hash-compared to the source) unless disabled.
+//! is one end-of-run filesystem sync (`syncfs`) by default (or per-file with `fsync_each`), and each
+//! copied file is **verified** (re-read + hash-compared to the source) unless disabled.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -25,7 +25,8 @@ pub struct Options {
     pub verify: bool,
     pub fsync_each: bool,
     pub backup_dir: Option<PathBuf>,
-    /// Worker threads for the verify hashing (1 = sequential).
+    /// Worker threads for verify hashing (1 = sequential). The CLI no longer exposes this; it's
+    /// kept at 1 in normal use and retained for the benchmark / possible future revival.
     pub jobs: usize,
 }
 
@@ -78,17 +79,17 @@ pub fn apply(src: &SrcRoot, dst: &DstRoot, actions: &[Action], opts: &Options, r
         }
     }
 
-    // Durability barrier: if we didn't fsync each file as we went, flush the copies now.
-    if !opts.fsync_each {
-        for (rel, _) in &copied {
-            let _ = File::open(dst.path().join(rel)).and_then(|f| f.sync_all());
-        }
+    // Durability barrier: unless we fsync'd each file as we went, make the whole run durable now.
+    // One filesystem sync flushes all copied data *and* the directory entries behind the atomic
+    // renames — far cheaper than fsync-per-file for many small files (see docs/theory.md).
+    if !opts.fsync_each && !actions.is_empty() {
+        sync_destination(dst, &copied);
     }
 
     // Verify: re-read each copied file and confirm it matches the source content.
     if opts.verify {
-        // Parallelizable read work (sequential unless --jobs > 1). Collect problems, then record
-        // them — keeping the report update single-threaded.
+        // Re-read + hash each copied file, then record problems off the hot path. `opts.jobs` is
+        // 1 in normal use (the CLI no longer exposes it), so this is sequential.
         let idx: Vec<usize> = (0..copied.len()).collect();
         let problems = crate::parallel::map(opts.jobs, idx, |i| {
             let (rel, want) = &copied[i];
@@ -109,6 +110,42 @@ pub fn apply(src: &SrcRoot, dst: &DstRoot, actions: &[Action], opts: &Options, r
 /// True iff the file at `path` hashes to `want`. (The verify check, exposed for testing.)
 pub fn verify_matches(path: &Path, want: &blake3::Hash) -> io::Result<bool> {
     Ok(&hash::hash_file(path)? == want)
+}
+
+/// Make the destination durable after the bulk (non-`fsync_each`) copy: flush all written data and
+/// the directory entries that make the atomic renames durable. On Linux one `syncfs` does this for
+/// the whole destination filesystem in a single call — far cheaper than fsync-per-file for many
+/// small files, and it covers the renames the old per-file loop never flushed. Elsewhere, fall back
+/// to fsync per copied file plus fsync per parent directory.
+fn sync_destination(dst: &DstRoot, copied: &[(PathBuf, blake3::Hash)]) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        if let Ok(dir) = File::open(dst.path()) {
+            // syncfs() flushes data + metadata (incl. rename dir-entries) for the whole fs at once.
+            if unsafe { libc::syncfs(dir.as_raw_fd()) } == 0 {
+                return;
+            }
+        }
+        // any failure falls through to the portable path below
+    }
+    fsync_files_and_dirs(copied.iter().map(|(rel, _)| dst.path().join(rel)));
+}
+
+/// Portable durability fallback: fsync each copied file, then fsync each unique parent directory so
+/// the atomic renames are persisted too. Best-effort — a real failure surfaces later in verify.
+fn fsync_files_and_dirs(paths: impl Iterator<Item = PathBuf>) {
+    use std::collections::BTreeSet;
+    let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    for path in paths {
+        let _ = File::open(&path).and_then(|f| f.sync_all());
+        if let Some(parent) = path.parent() {
+            dirs.insert(parent.to_path_buf());
+        }
+    }
+    for dir in &dirs {
+        let _ = File::open(dir).and_then(|f| f.sync_all()); // persist the directory entries (renames)
+    }
 }
 
 /// Post-sync stage for `--relative-symlinks`: make the mirror self-contained by rewriting every

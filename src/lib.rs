@@ -45,7 +45,8 @@ pub fn run(cli: Cli) -> ExitCode {
             for e in src_errs.iter().chain(dst_errs.iter()) {
                 eprintln!("filesync diff: {e}");
             }
-            match diff::diff(&src, &src_m, &dst, &dst_m, a.common.eager_checksum, a.common.jobs) {
+            // Hashing is sequential — the --jobs flag was removed (no measured benefit).
+            match diff::diff(&src, &src_m, &dst, &dst_m, a.common.eager_checksum, 1) {
                 Ok(d) => {
                     print!("{}", d.render());
                     ExitCode::SUCCESS
@@ -106,7 +107,8 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> ExitCode {
     let (dst_m, dst_errors) = scan::scan_with_errors(dst.path());
     scan_errors.extend(dst_errors);
 
-    let d = match diff::diff(src, &src_m, dst, &dst_m, a.common.eager_checksum, a.common.jobs) {
+    // Hashing is sequential — the --jobs flag was removed (no measured benefit; docs/theory.md).
+    let d = match diff::diff(src, &src_m, dst, &dst_m, a.common.eager_checksum, 1) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("filesync sync: {e}");
@@ -119,7 +121,7 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> ExitCode {
         verify: !a.no_verify,
         fsync_each: a.fsync_each,
         backup_dir: a.backup_dir.clone(),
-        jobs: a.common.jobs,
+        jobs: 1, // verify hashing is sequential (--jobs removed)
     };
 
     // Open the (streamed) report; fall back to in-memory if the file can't be created.

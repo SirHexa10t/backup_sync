@@ -48,20 +48,6 @@ pub struct Common {
     /// Report file path. Default: ./filesync-report-<source>-<YYYY-mm-DD_HHMM>.txt
     #[arg(long, value_name = "PATH")]
     pub report: Option<PathBuf>,
-
-    /// Worker threads for parallelizable work (content hashing). 1 = fully sequential (default);
-    /// higher speeds up hashing on fast storage but puts more concurrent load on the device.
-    #[arg(long, default_value_t = 1, value_name = "N", value_parser = parse_jobs)]
-    pub jobs: usize,
-}
-
-/// Parse `--jobs`: a whole number >= 1 (rejects 0, negatives, and non-numeric input).
-fn parse_jobs(s: &str) -> Result<usize, String> {
-    match s.parse::<usize>() {
-        Ok(n) if n >= 1 => Ok(n),
-        Ok(_) => Err("must be at least 1".to_string()),
-        Err(_) => Err(format!("`{s}` is not a whole number >= 1")),
-    }
 }
 
 #[derive(Args, Debug)]
@@ -142,6 +128,9 @@ mod tests {
         assert!(Cli::try_parse_from(["filesync", "diff"]).is_err());
     }
 
+    // The `--jobs` flag was removed (parallelism showed no benefit — see docs/theory.md). These
+    // tests are commented out rather than deleted, for easy revival if the flag ever returns.
+    /*
     #[test]
     fn jobs_defaults_to_one_and_parses() {
         let c = Cli::try_parse_from(["filesync", "sync", "--from", "/a", "--to", "/b"]).unwrap();
@@ -162,6 +151,7 @@ mod tests {
             );
         }
     }
+    */
 
     #[test]
     fn sync_only_flags_are_rejected_on_diff() {

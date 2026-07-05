@@ -235,8 +235,8 @@ Two firm conclusions:
 
 1. **Parallelizing copies does not help — it hurts.** In *both* barriers the best result is at
    **jobs=1**; more workers are flat-to-worse. The earlier prototype's "~1.5× for small writes" was
-   an artifact of omitting fsync. **Decision: copies stay sequential** — which also validates the
-   existing design.
+   an artifact of omitting fsync. **Decision: copies stay sequential, and the `--jobs` flag (which
+   only parallelized hashing) was removed** — which also validates the existing design.
 2. **`fsync` is the real lever.** At the setting filesync actually runs (sequential, jobs=1), one
    fs-sync is **~1.5× faster** than per-file fsync (72 vs 48 MiB/s; up to ~2× at some worker counts).
    The barrier is 49,152 *serialized* device flushes — a large fixed cost that dominates a small-file
@@ -244,9 +244,10 @@ Two firm conclusions:
 
 ### The fix: one fs-sync, not N per-file fsyncs
 
-This resolves the discrepancy the plan already implied: `apply.rs` loops `sync_all` per copied file,
-but the plan specifies **one filesystem sync at the end**. Bringing the code in line is the
-**highest-value change** for small-file backups — it is both:
+This resolves the discrepancy the plan already implied: the barrier looped `sync_all` per copied
+file, but the plan specifies **one filesystem sync at the end**. It is now **implemented** in
+`apply.rs` — `syncfs` on the destination, with a portable fsync-per-file + per-directory fallback —
+the highest-value change for small-file backups, because it is both:
 
 - **~1.5× faster** (data above): it replaces tens of thousands of serialized device flushes with a
   single `syncfs`; and
@@ -261,7 +262,7 @@ cache). The **jobs=1 `each`-vs-`fs` gap is the cleanest, most decision-relevant 
 ## Decisions locked
 
 - Copy engine: **pure Rust**, no external tool.
-- Durability: **staged copy → end-sync → verify → correct**; no per-file fsync by default
+- Durability: **staged copy → one `syncfs` → verify → correct**; no per-file fsync by default
   (`--fsync-each` escape).
 - Correctness: **verify on by default** (`--no-verify` escape).
 - Efficiency: **skip-identical + move-as-rename**, identity by blake3 content hash.
@@ -269,17 +270,18 @@ cache). The **jobs=1 `each`-vs-`fs` gap is the cleanest, most decision-relevant 
   early deletes (no prompts — preview via `diff`; `--backup-dir` for recoverable deletes),
   `--eager-checksum` opt-in.
 - Manifest: **in-memory**, recomputed per run (no persisted tracking file).
-- Copies **sequential** — parallelism gives no benefit on the target media (measured, both
-  durability modes; jobs=1 is best). `--jobs` parallelizes only hashing, default 1.
+- Copies **sequential**, hashing too — parallelism gives no benefit on the target media (measured,
+  both durability modes; jobs=1 is best). The `--jobs` flag was **removed**; `parallel.rs` is kept
+  only for the benchmark.
 
 ## Next
 
 The engine is implemented (scan + manifest + hashing, diff + report, staged copy/verify/correct,
 move-as-rename, mirror-with-backup), each with tests.
 
-1. **Fix the durability barrier — top priority.** Replace the per-file `sync_all` loop in `apply.rs`
-   with a single `syncfs` on the destination (plus parent-directory fsyncs so the atomic renames are
-   durable). Measured ~1.5× on small-file backups, and it closes a real durability gap. See the copy
-   sweep above.
-2. **Parallelism — settled.** The authentic copy sweep shows no benefit (it hurts); copies stay
-   sequential and `--jobs` (hashing only) stays default 1. No parallel copy stage.
+1. **Durability barrier — done.** The per-file `sync_all` loop is replaced by a single `syncfs` on
+   the destination (with a portable fsync-per-file + per-directory fallback), keeping `--fsync-each`
+   as the escape. ~1.5× on small-file backups, and it closes the rename-durability gap.
+2. **Parallelism — settled and removed.** The authentic copy sweep showed no benefit (it hurts);
+   copies stay sequential and the `--jobs` flag is gone. `parallel.rs`/rayon are retained only for
+   the benchmark's worker-count sweeps.
