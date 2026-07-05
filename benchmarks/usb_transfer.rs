@@ -18,6 +18,9 @@
 //!   cargo bench --bench usb_transfer -- copy     MY_USB_A MY_USB_B
 //!   cargo bench --bench usb_transfer -- clean    MY_USB_A
 //!
+//!   # --jobs scaling sweep (1,2,4,6,8,16 workers) over a 4 GiB corpus, cold each run:
+//!   cargo bench --bench usb_transfer -- jobs     MY_USB_A
+//!
 //! Find labels with:  lsblk -o NAME,LABEL,FSTYPE,MOUNTPOINT
 //! If you omit the drive args, the LABEL_A / LABEL_B defaults below are used.
 //! ─────────────────────────────────────────────────────────────────────────────
@@ -52,6 +55,8 @@ const LABEL_B: &str = "CHANGE_ME_B";
 /// Total size PER PROFILE. Start small to sanity-check, then bump to 20 for a real run.
 /// Overridable per-run with the FILESYNC_BENCH_MIB env var (handy for quick smoke-tests).
 const GIB_PER_PROFILE: u64 = 1;
+/// Per-profile total for the `jobs` sweep (also overridable via FILESYNC_BENCH_MIB).
+const JOBS_GIB_PER_PROFILE: u64 = 4;
 // ===============================================================================================
 
 const KIB: u64 = 1 << 10;
@@ -74,12 +79,21 @@ struct Profile {
 }
 
 fn profiles() -> Vec<Profile> {
-    let total = std::env::var("FILESYNC_BENCH_MIB")
+    profiles_of(env_total_bytes(GIB_PER_PROFILE))
+}
+
+/// Per-profile total in bytes: `FILESYNC_BENCH_MIB` (in MiB) if set, else `default_gib` GiB.
+fn env_total_bytes(default_gib: u64) -> u64 {
+    std::env::var("FILESYNC_BENCH_MIB")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .map(|mib| mib * MIB)
-        .unwrap_or(GIB_PER_PROFILE * GIB);
-    // Clamp file sizes to the total so tiny smoke-test totals still yield ≥1 file per profile.
+        .unwrap_or(default_gib * GIB)
+}
+
+/// The two corpus shapes for a given per-profile total. File sizes are clamped to the total so tiny
+/// smoke-test totals still yield ≥1 file per profile.
+fn profiles_of(total: u64) -> Vec<Profile> {
     let large = LARGE_FILE_BYTES.min(total);
     let small = SMALL_FILE_BYTES.min(total);
     vec![
@@ -491,21 +505,9 @@ fn phase_create(spec: &str) {
 
     for p in profiles() {
         let dir = corpus_dir(&d.path, p.name);
-        fs::create_dir_all(&dir).expect("create corpus dir");
-        let mut state: u64 = 0x9E3779B97F4A7C15 ^ p.file_bytes; // distinct stream per profile
-        let mut buf = vec![0u8; BUF_BYTES];
-
-        let prog = Progress::start(&format!("write {}", p.name), p.count * p.file_bytes, p.count);
         let t = Instant::now();
-        for i in 0..p.count {
-            let path = dir.join(format!("f_{i:06}"));
-            if let Err(e) = write_random_file(&path, p.file_bytes, &mut buf, &mut state, &prog) {
-                prog.finish();
-                fail_out_of_space(&e, &d.path, &d.name, block, &p, &path);
-            }
-        }
+        write_corpus_profile(&dir, &p, block, &d.path, &d.name);
         let secs = t.elapsed().as_secs_f64();
-        prog.finish();
         record(Row {
             phase: "write",
             from: d.name.clone(),
@@ -518,6 +520,23 @@ fn phase_create(spec: &str) {
             secs,
         });
     }
+}
+
+/// Create `dir` and fill it with `p.count` random, fsync'd files. Shared by the WRITE phase and the
+/// jobs-sweep corpus setup. Exits via `fail_out_of_space` on ENOSPC (removing the partial corpus).
+fn write_corpus_profile(dir: &Path, p: &Profile, block: u64, drive: &Path, drive_name: &str) {
+    fs::create_dir_all(dir).expect("create corpus dir");
+    let mut state: u64 = 0x9E3779B97F4A7C15 ^ p.file_bytes; // distinct stream per profile
+    let mut buf = vec![0u8; BUF_BYTES];
+    let prog = Progress::start(&format!("write {}", p.name), p.count * p.file_bytes, p.count);
+    for i in 0..p.count {
+        let path = dir.join(format!("f_{i:06}"));
+        if let Err(e) = write_random_file(&path, p.file_bytes, &mut buf, &mut state, &prog) {
+            prog.finish();
+            fail_out_of_space(&e, drive, drive_name, block, p, &path);
+        }
+    }
+    prog.finish();
 }
 
 /// CHECKSUM benchmark: blake3-hash the whole corpus on `drive`, in parallel, time it.
@@ -636,6 +655,72 @@ fn phase_clean(spec: &str) {
     let scratch = scratch_root(&d.path);
     guarded_remove_dir_all(&scratch, &d.path);
     println!("cleaned {scratch:?}");
+}
+
+/// JOBS sweep: how does `--jobs` scale cold reads on this device?
+///
+/// `--jobs` parallelizes only filesync's content hashing (the verify stage and move-detection);
+/// copies are always sequential. So this measures the hashing path directly: write a corpus per
+/// profile once, then re-hash it at 1/2/4/6/8/16 workers — using filesync's own `parallel::map` +
+/// `hash_file` — dropping the page cache (unmount+remount) before each run so every measurement
+/// reads from the device, not RAM. On a single flash controller more workers may not help (or may
+/// hurt from seek/contention); that's exactly what this reveals.
+fn phase_jobs(spec: &str) {
+    const JOBS: &[usize] = &[1, 2, 4, 6, 8, 16];
+
+    let d0 = resolve_drive(spec);
+    assert_mounted(&d0.path);
+    let block = block_size(&d0.path);
+    let total = env_total_bytes(JOBS_GIB_PER_PROFILE);
+    // One profile lives on the drive at a time (written, swept, removed), so we need room for the
+    // largest single profile.
+    let peak = profiles_of(total)
+        .iter()
+        .map(|p| p.count * on_disk(p.file_bytes, block))
+        .max()
+        .unwrap_or(0);
+    ensure_space(&d0.path, with_margin(peak), &d0.name);
+
+    for p in profiles_of(total) {
+        // Build this profile's corpus once (fsync'd; setup, not part of any measurement).
+        let dir = corpus_dir(&d0.path, p.name);
+        guarded_remove_dir_all(&dir, &d0.path);
+        write_corpus_profile(&dir, &p, block, &d0.path, &d0.name);
+
+        let file_bytes = p.file_bytes;
+        for &jobs in JOBS {
+            clear_cache(&[spec]); // unmount+remount (or drop_caches) → cold reads
+            let d = resolve_drive(spec); // re-resolve: a remount can change the mountpoint
+            assert_mounted(&d.path);
+            let files = list_files(&corpus_dir(&d.path, p.name));
+            if files.is_empty() {
+                eprintln!("no files found after remount; aborting jobs sweep");
+                return;
+            }
+
+            let prog = Progress::start(
+                &format!("hash {}/{}j", p.name, jobs),
+                files.len() as u64 * file_bytes,
+                files.len() as u64,
+            );
+            let t = Instant::now();
+            // filesync's real parallel path: sequential when jobs==1, else a pool of `jobs` threads.
+            let _ = filesync::parallel::map(jobs, files.clone(), |f| {
+                let h = filesync::hash::hash_file(&f).expect("hash file");
+                prog.add_bytes(file_bytes);
+                h
+            });
+            let secs = t.elapsed().as_secs_f64();
+            prog.finish();
+            record_jobs(&d.name, p.name, jobs, files.len() as u64, files.len() as u64 * file_bytes, secs);
+        }
+
+        // Reclaim the drive before the next profile's corpus.
+        let d = resolve_drive(spec);
+        guarded_remove_dir_all(&corpus_dir(&d.path, p.name), &d.path);
+    }
+
+    eprintln!("\nDone. Results appended to benchmarks/results/jobs_results.csv");
 }
 
 // ── the copy primitive we're actually measuring ──────────────────────────────
@@ -770,6 +855,35 @@ fn record(r: Row) {
     }
 }
 
+/// Append one jobs-sweep measurement to `jobs_results.csv` — kept separate from the WRITE/CHECKSUM/
+/// COPY results so its extra `jobs` dimension doesn't disturb that schema.
+fn record_jobs(drive: &str, profile: &str, jobs: usize, files: u64, bytes: u64, secs: f64) {
+    let mib = bytes as f64 / MIB as f64;
+    let mib_s = if secs > 0.0 { mib / secs } else { 0.0 };
+    let files_s = if secs > 0.0 { files as f64 / secs } else { 0.0 };
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+
+    println!(
+        "jobs={:<2} {:<6} {:>10}  {:>7} files  {:>10.1} MiB  {:>8.2} s  =>  {:>7.1} MiB/s  {:>10.1} files/s",
+        jobs, profile, drive, files, mib, secs, mib_s, files_s
+    );
+
+    let results_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmarks/results");
+    let _ = fs::create_dir_all(&results_dir);
+    let csv = results_dir.join("jobs_results.csv");
+    let new = !csv.exists();
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&csv) {
+        if new {
+            let _ = writeln!(f, "unix_ts,drive,profile,jobs,files,mib,secs,mib_per_s,files_per_s");
+        }
+        let _ = writeln!(
+            f,
+            "{},{},{},{},{},{:.1},{:.3},{:.1},{:.1}",
+            ts, drive, profile, jobs, files, mib, secs, mib_s, files_s
+        );
+    }
+}
+
 // ── entry ─────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -783,6 +897,7 @@ fn main() {
         "create" => phase_create(arg(1, LABEL_A)),
         "checksum" => phase_checksum(arg(1, LABEL_A)),
         "copy" => phase_copy(arg(1, LABEL_A), arg(2, LABEL_B)),
+        "jobs" => phase_jobs(arg(1, LABEL_A)),
         "clean" => phase_clean(arg(1, LABEL_A)),
         _ => {
             eprintln!(
@@ -791,6 +906,7 @@ fn main() {
                  \tcargo bench --bench usb_transfer -- create   <drive>\n\
                  \tcargo bench --bench usb_transfer -- checksum <drive>\n\
                  \tcargo bench --bench usb_transfer -- copy     <driveFrom> <driveTo>\n\
+                 \tcargo bench --bench usb_transfer -- jobs     <drive>\n\
                  \tcargo bench --bench usb_transfer -- clean    <drive>\n\n\
                  Find labels with:  lsblk -o NAME,LABEL,FSTYPE,MOUNTPOINT"
             );

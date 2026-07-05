@@ -112,3 +112,56 @@ pub fn snapshot_files(root: &Path) -> BTreeMap<PathBuf, (u64, Option<SystemTime>
     }
     out
 }
+
+/// Strip all permissions (0o000) from an existing path — used to simulate an unreadable file or
+/// directory. Restore with [`restore_perms`] before the tempdir is dropped, or its cleanup leaks.
+#[cfg(unix)]
+pub fn set_no_perms(root: &Path, rel: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(root.join(rel), fs::Permissions::from_mode(0o000)).unwrap();
+}
+
+/// Restore owner rwx (0o755) so a previously locked file/dir can be cleaned up. Unix only.
+#[cfg(unix)]
+pub fn restore_perms(root: &Path, rel: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(root.join(rel), fs::Permissions::from_mode(0o755));
+}
+
+/// Whether 0-permission entries actually block access here. Returns false when running as root
+/// (which bypasses permission bits), so permission tests can skip instead of spuriously failing.
+/// Probes by creating a locked file under `dir` and checking whether it can still be opened.
+#[cfg(unix)]
+pub fn permissions_enforced(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join(".probe_perms");
+    let _ = fs::remove_file(&p);
+    if File::create(&p).is_err() {
+        return false;
+    }
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o000)).unwrap();
+    let blocked = File::open(&p).is_err();
+    let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o644));
+    let _ = fs::remove_file(&p);
+    blocked
+}
+#[cfg(not(unix))]
+pub fn permissions_enforced(_dir: &Path) -> bool {
+    false
+}
+
+/// Create a FIFO (named pipe) at `rel` — a `Kind::Other` special file. Returns false if the
+/// filesystem doesn't support it (skip the test then). Unix only.
+#[cfg(unix)]
+pub fn make_fifo(root: &Path, rel: &str) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let p = root.join(rel);
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    match CString::new(p.as_os_str().as_bytes()) {
+        Ok(c) => unsafe { libc::mkfifo(c.as_ptr(), 0o644) == 0 },
+        Err(_) => false,
+    }
+}

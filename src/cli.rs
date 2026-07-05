@@ -51,8 +51,17 @@ pub struct Common {
 
     /// Worker threads for parallelizable work (content hashing). 1 = fully sequential (default);
     /// higher speeds up hashing on fast storage but puts more concurrent load on the device.
-    #[arg(long, default_value_t = 1, value_name = "N")]
+    #[arg(long, default_value_t = 1, value_name = "N", value_parser = parse_jobs)]
     pub jobs: usize,
+}
+
+/// Parse `--jobs`: a whole number >= 1 (rejects 0, negatives, and non-numeric input).
+fn parse_jobs(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(n) if n >= 1 => Ok(n),
+        Ok(_) => Err("must be at least 1".to_string()),
+        Err(_) => Err(format!("`{s}` is not a whole number >= 1")),
+    }
 }
 
 #[derive(Args, Debug)]
@@ -75,9 +84,16 @@ pub struct SyncArgs {
     #[arg(long)]
     pub fsync_each: bool,
 
-    /// Move files that would be deleted or overwritten here, instead of erasing them.
+    /// Move files that would be deleted or overwritten here, instead of erasing them. Must be on
+    /// the same filesystem as the destination.
     #[arg(long, value_name = "DIR")]
     pub backup_dir: Option<PathBuf>,
+
+    /// Rewrite symlinks whose target is inside the source so they point at the mirrored location
+    /// inside the destination (as relative paths), making the backup self-contained. Links that
+    /// resolve outside the source are copied verbatim; broken links are copied and reported.
+    #[arg(long)]
+    pub relative_symlinks: bool,
 }
 
 impl Command {
@@ -98,7 +114,7 @@ mod tests {
     fn parses_sync_with_all_flags() {
         let cli = Cli::try_parse_from([
             "filesync", "sync", "--from", "/a", "--to", "/b", "--eager-checksum", "--no-verify",
-            "--fsync-each", "--backup-dir", "/trash",
+            "--fsync-each", "--backup-dir", "/trash", "--relative-symlinks",
         ])
         .unwrap();
         match cli.command {
@@ -107,6 +123,7 @@ mod tests {
                 assert_eq!(a.common.to, PathBuf::from("/b"));
                 assert!(a.common.eager_checksum && a.no_verify && a.fsync_each);
                 assert_eq!(a.backup_dir, Some(PathBuf::from("/trash")));
+                assert!(a.relative_symlinks);
             }
             _ => panic!("expected sync"),
         }
@@ -133,6 +150,17 @@ mod tests {
             Cli::try_parse_from(["filesync", "diff", "--from", "/a", "--to", "/b", "--jobs", "4"])
                 .unwrap();
         assert_eq!(c2.command.common().jobs, 4);
+    }
+
+    #[test]
+    fn jobs_rejects_zero_negative_and_non_numeric() {
+        for bad in ["0", "-1", "abc", "1.5", ""] {
+            assert!(
+                Cli::try_parse_from(["filesync", "sync", "--from", "/a", "--to", "/b", "--jobs", bad])
+                    .is_err(),
+                "expected --jobs {bad:?} to be rejected"
+            );
+        }
     }
 
     #[test]

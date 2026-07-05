@@ -104,3 +104,29 @@ fn scanning_does_not_modify_the_tree() {
     let after = common::snapshot_files(tmp.path());
     assert_eq!(before, after);
 }
+
+#[cfg(unix)]
+#[test]
+fn scan_reports_an_unreadable_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    if !common::permissions_enforced(tmp.path()) {
+        eprintln!("skipping: permission bits not enforced (running as root?)");
+        return;
+    }
+    common::file(tmp.path(), "readable.txt", b"ok");
+    common::file(tmp.path(), "locked/secret.txt", b"hidden");
+    common::set_no_perms(tmp.path(), "locked"); // can't list the directory's contents
+
+    let (m, errors) = filesync::scan::scan_with_errors(tmp.path());
+    common::restore_perms(tmp.path(), "locked"); // let the tempdir clean itself up
+
+    // readable siblings are still scanned
+    assert!(rels(&m).iter().any(|p| p == "readable.txt"));
+    // the unreadable directory produced a reported error naming it (not a silent omission)
+    assert!(
+        errors.iter().any(|e| e.contains("locked")),
+        "expected a scan error mentioning 'locked': {errors:?}"
+    );
+    // and its hidden contents were NOT silently pulled in
+    assert!(!rels(&m).iter().any(|p| p == "locked/secret.txt"));
+}

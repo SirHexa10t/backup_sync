@@ -17,6 +17,9 @@ libc = "0.2" # posix_fadvise(DONTNEED) for cold-read verification
 tempfile = "3"
 indicatif = "0.17" # used by the usb_transfer benchmark
 
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2" # mkfifo(), to build a Kind::Other special file in tests
+
 # Removable-device transfer benchmark (WRITE / CHECKSUM / COPY, with fsync & verify variants).
 # Custom harness so it takes subcommands and can be run phase-by-phase to defeat the page cache.
 #   cargo bench --bench usb_transfer -- all <driveA> <driveB>

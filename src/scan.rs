@@ -8,19 +8,40 @@ use walkdir::WalkDir;
 
 use crate::manifest::{Entry, Kind, Manifest};
 
-/// Scan `root` into a manifest sorted by relative path.
+/// Scan `root` into a manifest sorted by relative path. Read errors are discarded — use
+/// [`scan_with_errors`] when you need to report files/directories that couldn't be read.
 pub fn scan(root: &Path) -> Manifest {
-    let mut entries: Vec<Entry> = WalkDir::new(root)
-        .follow_links(false)
-        .min_depth(1) // exclude the root itself
-        .into_iter()
-        .filter_map(Result::ok) // TODO: collect walk errors into the run report (report.rs)
-        // ignore our own atomic-copy temp files — they're scratch, not real content
-        .filter(|dent| !dent.file_name().to_string_lossy().starts_with(crate::apply::TMP_PREFIX))
-        .map(|dent| entry_from(root, &dent))
-        .collect();
+    scan_with_errors(root).0
+}
+
+/// Like [`scan`], but also returns human-readable messages for entries that couldn't be read
+/// (e.g. a permission-denied directory), so a run can surface them instead of silently omitting
+/// their contents. Readable entries are still collected either way.
+pub fn scan_with_errors(root: &Path) -> (Manifest, Vec<String>) {
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for result in WalkDir::new(root).follow_links(false).min_depth(1) {
+        match result {
+            // ignore our own atomic-copy temp files — they're scratch, not real content
+            Ok(dent)
+                if dent.file_name().to_string_lossy().starts_with(crate::apply::TMP_PREFIX) => {}
+            Ok(dent) => entries.push(entry_from(root, &dent)),
+            Err(e) => errors.push(describe_walk_error(&e)),
+        }
+    }
+
     entries.sort_by(|a, b| a.rel.cmp(&b.rel));
-    Manifest::from_sorted(entries)
+    (Manifest::from_sorted(entries), errors)
+}
+
+/// Render a walk error as `cannot read <path>: <reason>` (falling back to the raw error).
+fn describe_walk_error(e: &walkdir::Error) -> String {
+    match (e.path(), e.io_error()) {
+        (Some(p), Some(io)) => format!("cannot read {}: {io}", p.display()),
+        (Some(p), None) => format!("cannot read {}: {e}", p.display()),
+        _ => format!("scan error: {e}"),
+    }
 }
 
 fn entry_from(root: &Path, dent: &walkdir::DirEntry) -> Entry {

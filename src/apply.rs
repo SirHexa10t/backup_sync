@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::hash;
-use crate::manifest::{DstRoot, SrcRoot};
+use crate::manifest::{DstRoot, Kind, Manifest, SrcRoot};
 use crate::plan::Action;
 use crate::report::Report;
 
@@ -111,6 +111,61 @@ pub fn verify_matches(path: &Path, want: &blake3::Hash) -> io::Result<bool> {
     Ok(&hash::hash_file(path)? == want)
 }
 
+/// Post-sync stage for `--relative-symlinks`: make the mirror self-contained by rewriting every
+/// symlink whose target resolves *inside the source* to the equivalent location *inside the
+/// destination*, expressed as a relative path (so it survives the mirror being mounted elsewhere).
+///
+/// Links that resolve outside the source are left exactly as copied; broken links are left as
+/// copied and noted in the report. Runs after `apply`, so it never disturbs the copy/verify stages.
+pub fn relink_internal_symlinks(src: &SrcRoot, dst: &DstRoot, src_m: &Manifest, report: &mut Report) {
+    let src_root = match fs::canonicalize(src.path()) {
+        Ok(c) => c,
+        Err(e) => {
+            report.issue_msg(format!("--relative-symlinks: cannot resolve source root: {e}"));
+            return;
+        }
+    };
+    for e in src_m.iter().filter(|e| e.kind == Kind::Symlink) {
+        // Resolve the link's target as it stands in the (read-only) source.
+        match fs::canonicalize(src.path().join(&e.rel)) {
+            Ok(target) => {
+                if let Ok(inside) = target.strip_prefix(&src_root) {
+                    let new_target = relative_link(&e.rel, inside);
+                    if let Err(err) = recreate_symlink(&dst.path().join(&e.rel), &new_target) {
+                        report.issue(e.rel.clone(), &err);
+                    }
+                }
+                // else: resolves outside the source → leave the copied link untouched
+            }
+            Err(_) => report.issue_msg(format!(
+                "{}: broken symlink (target does not resolve), copied as-is",
+                e.rel.display()
+            )),
+        }
+    }
+}
+
+/// The relative path a symlink at `link_rel` should use to point at `target_rel`, where both are
+/// relative to the same root: walk up from the link's own directory to the common ancestor, then
+/// down to the target. e.g. `links/rel` → `f1/b.txt` yields `../f1/b.txt`.
+fn relative_link(link_rel: &Path, target_rel: &Path) -> PathBuf {
+    let base: Vec<_> = link_rel.parent().unwrap_or_else(|| Path::new("")).components().collect();
+    let target: Vec<_> = target_rel.components().collect();
+    let common = base.iter().zip(&target).take_while(|(a, b)| a == b).count();
+
+    let mut out = PathBuf::new();
+    for _ in common..base.len() {
+        out.push("..");
+    }
+    for c in &target[common..] {
+        out.push(c.as_os_str());
+    }
+    if out.as_os_str().is_empty() {
+        out.push("."); // link points at its own directory
+    }
+    out
+}
+
 fn do_rename(dst: &DstRoot, from: &Path, to: &Path) -> io::Result<()> {
     let (fp, tp) = (dst.path().join(from), dst.path().join(to));
     if let Some(parent) = tp.parent() {
@@ -131,16 +186,21 @@ fn do_delete(dst: &DstRoot, rel: &Path, opts: &Options) -> io::Result<()> {
     } else {
         // file or symlink
         match &opts.backup_dir {
-            Some(bdir) => {
-                let target = bdir.join(rel);
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::rename(&path, &target) // move aside instead of erasing
-            }
+            Some(bdir) => move_to_backup(&path, rel, bdir), // move aside instead of erasing
             None => fs::remove_file(&path),
         }
     }
+}
+
+/// Move the destination entry at `abs_path` into `bdir`, mirroring its `rel` layout — the shared
+/// mechanism behind `--backup-dir` for both deleted and overwritten files. Uses `rename`, so
+/// `bdir` must be on the same filesystem as the destination.
+fn move_to_backup(abs_path: &Path, rel: &Path, bdir: &Path) -> io::Result<()> {
+    let target = bdir.join(rel);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(abs_path, &target)
 }
 
 enum Copied {
@@ -205,6 +265,17 @@ fn copy_file_atomic(
         let _ = fs::set_permissions(&tmp, src_meta.permissions());
     }
 
+    // If we're about to overwrite an existing entry and a backup dir is set, move the old version
+    // aside first — the "overwritten" half of --backup-dir (deletes are handled in do_delete).
+    if let Some(bdir) = &opts.backup_dir {
+        if fs::symlink_metadata(&final_path).is_ok() {
+            if let Err(e) = move_to_backup(&final_path, rel, bdir) {
+                let _ = fs::remove_file(&tmp);
+                return Err(e);
+            }
+        }
+    }
+
     if let Err(e) = fs::rename(&tmp, &final_path) {
         let _ = fs::remove_file(&tmp);
         return Err(e);
@@ -265,3 +336,34 @@ fn drop_cache(path: &Path) {
 
 #[cfg(not(unix))]
 fn drop_cache(_path: &Path) {}
+
+#[cfg(test)]
+mod tests {
+    use super::relative_link;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn relative_link_from_root() {
+        assert_eq!(relative_link(Path::new("abs"), Path::new("f1/b.txt")), PathBuf::from("f1/b.txt"));
+    }
+
+    #[test]
+    fn relative_link_preserves_an_internal_relative_link() {
+        // links/rel -> f1/b.txt  ⇒  ../f1/b.txt  (so already-relative links are unchanged)
+        assert_eq!(
+            relative_link(Path::new("links/rel"), Path::new("f1/b.txt")),
+            PathBuf::from("../f1/b.txt")
+        );
+    }
+
+    #[test]
+    fn relative_link_with_shared_prefix() {
+        // a/b/link -> a/c/x  ⇒  ../c/x
+        assert_eq!(relative_link(Path::new("a/b/link"), Path::new("a/c/x")), PathBuf::from("../c/x"));
+    }
+
+    #[test]
+    fn relative_link_in_same_directory() {
+        assert_eq!(relative_link(Path::new("dir/link"), Path::new("dir/tgt")), PathBuf::from("tgt"));
+    }
+}
