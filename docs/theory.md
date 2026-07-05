@@ -3,7 +3,12 @@
 This is the "why" behind filesync: what we're optimizing for, the measurements that grounded the
 design, and how those measurements lead to the plan we settled on. It reads as research notes, not
 just a checklist — the raw data lives in
-[`../benchmarks/results/1GiB_USB_results.csv`](../benchmarks/results/1GiB_USB_results.csv).
+[`../benchmarks/results/1GiB_USB_results.csv`](../benchmarks/results/1GiB_USB_results.csv) (the
+WRITE/CHECKSUM/COPY study) and
+[`../benchmarks/results/4GiB_parallel_results.csv`](../benchmarks/results/4GiB_parallel_results.csv)
+(the `--jobs` parallelism study), and
+[`../benchmarks/results/3GiB_copy_parallel_results.csv`](../benchmarks/results/3GiB_copy_parallel_results.csv)
+(the authentic parallel-copy + durability study).
 
 ## Aim
 
@@ -169,6 +174,90 @@ The verify stage guarantees byte-perfect copies; the end-sync guarantees durabil
 the pre-flight **diff report** (new / changed / moved / deleted) plus the post-run **issues report**
 give the operator complete visibility into what happened and what needs attention.
 
+## Parallelism (`--jobs`): a second experiment
+
+A later benchmark asked whether worker parallelism helps on the target media. `--jobs` currently
+parallelizes only filesync's **hashing** (verify + move-detection); copies are sequential. The
+sweep ran WRITE and READ at 1/2/4/6/8/16 workers over **4 GiB per profile**, cold before each run,
+on **USB-SATA-BTRFS** — raw data in
+[`../benchmarks/results/4GiB_parallel_results.csv`](../benchmarks/results/4GiB_parallel_results.csv).
+
+Throughput vs workers (MiB/s):
+
+| op / profile   | 1 | 2 | 4 | 6 | 8 | 16 |
+|---|--:|--:|--:|--:|--:|--:|
+| write / large  | 249 | 185 | 216 | 195 | 168 | 184 |
+| write / small  |  82 | 105 | **129** | 109 | 121 | 128 |
+| read  / large  | 357 | 279 | 290 | 271 | 274 | 355 |
+| read  / small  | 106 | 146 | 149 | 143 | 127 | 128 |
+
+Tentative reading:
+
+- **Large files: parallelism buys nothing**, read or write — one stream already saturates the
+  device; jobs=1 is as fast as anything.
+- **Small-file writes: ~1.5× from ~4 workers** (82 → 129 MiB/s), plateauing by jobs≈4 — per-file
+  overhead (create/close/metadata) overlaps across workers.
+- **Reads don't scale** meaningfully on this device.
+
+### Caveat: this is a hint, not a verdict
+
+Two things make these numbers directional only:
+
+1. **The write prototype is not filesync's copy.** It generates data in RAM (no **source read**),
+   does no **blake3 hashing**, skips the **temp-file + rename + mtime/perms**, and — most important
+   — flushes with **one global `sync`** where filesync does **one `sync_all` per file** at the end
+   (`apply.rs`). For the small profile that is 65,536 fsyncs of real cost the benchmark never pays,
+   so it measures an *idealized* filesync; the small-file numbers in particular overstate what the
+   real program would achieve.
+2. **The read numbers aren't repeatable.** Each is a single cold sample, taken right after tens of
+   GiB of writes, over a corpus written by 16 parallel writers (a nondeterministic Btrfs layout).
+   The large-file reads swung ~25% between two runs; treat the read *shape* as noise, not signal.
+
+Also: only one device (Btrfs SATA) was measured this round.
+
+### Authentic copy sweep — the verdict
+
+The `jobs` sweep above was a data-*generating* prototype. To settle it, a second sweep copies a real
+corpus (internal disk → USB) through filesync's **actual copy path** (`copy_one`: read source +
+blake3-hash + temp file + rename) at 1–16 workers, under both durability barriers — `each` (one
+`sync_all` per file, filesync's *current* behavior) and `fs` (one filesystem `sync`). 3 GiB of small
+files (49,152 × 64 KiB) → USB-SATA-BTRFS; raw data in
+[`../benchmarks/results/3GiB_copy_parallel_results.csv`](../benchmarks/results/3GiB_copy_parallel_results.csv).
+
+Small-file copy throughput, MiB/s:
+
+| durability | 1 | 2 | 4 | 6 | 8 | 16 |
+|---|--:|--:|--:|--:|--:|--:|
+| `each` (per-file fsync) | 48 | 49 | 32 | 44 | 33 | 38 |
+| `fs` (one fs-sync)      | **72** | 64 | 71 | 45 | 54 | 40 |
+
+Two firm conclusions:
+
+1. **Parallelizing copies does not help — it hurts.** In *both* barriers the best result is at
+   **jobs=1**; more workers are flat-to-worse. The earlier prototype's "~1.5× for small writes" was
+   an artifact of omitting fsync. **Decision: copies stay sequential** — which also validates the
+   existing design.
+2. **`fsync` is the real lever.** At the setting filesync actually runs (sequential, jobs=1), one
+   fs-sync is **~1.5× faster** than per-file fsync (72 vs 48 MiB/s; up to ~2× at some worker counts).
+   The barrier is 49,152 *serialized* device flushes — a large fixed cost that dominates a small-file
+   backup and swamps everything else.
+
+### The fix: one fs-sync, not N per-file fsyncs
+
+This resolves the discrepancy the plan already implied: `apply.rs` loops `sync_all` per copied file,
+but the plan specifies **one filesystem sync at the end**. Bringing the code in line is the
+**highest-value change** for small-file backups — it is both:
+
+- **~1.5× faster** (data above): it replaces tens of thousands of serialized device flushes with a
+  single `syncfs`; and
+- **more correct** — `syncfs` also flushes the directory entries that make the atomic `rename`s
+  durable, which the current per-file `sync_all` loop never does (a latent durability gap in the
+  default path — and reliability is aim #1).
+
+Caveats on the numbers: single cold samples (noisy — e.g. `fs` jobs=6 dipped), one device (Btrfs
+SATA SSD), and 3 GiB may be partly SLC-assisted (less so for `each`, whose fsyncs defeat the write
+cache). The **jobs=1 `each`-vs-`fs` gap is the cleanest, most decision-relevant point**.
+
 ## Decisions locked
 
 - Copy engine: **pure Rust**, no external tool.
@@ -180,9 +269,17 @@ give the operator complete visibility into what happened and what needs attentio
   early deletes (no prompts — preview via `diff`; `--backup-dir` for recoverable deletes),
   `--eager-checksum` opt-in.
 - Manifest: **in-memory**, recomputed per run (no persisted tracking file).
+- Copies **sequential** — parallelism gives no benefit on the target media (measured, both
+  durability modes; jobs=1 is best). `--jobs` parallelizes only hashing, default 1.
 
 ## Next
 
-With durability (staged, fsync-off default) and verify (on) settled, and the read-only enforcement
-approach confirmed, the remaining work is implementation — Phase 1 onward: in-memory scan + manifest
-+ hashing, then diff + report, then the staged copy/verify/correct engine, each with its tests.
+The engine is implemented (scan + manifest + hashing, diff + report, staged copy/verify/correct,
+move-as-rename, mirror-with-backup), each with tests.
+
+1. **Fix the durability barrier — top priority.** Replace the per-file `sync_all` loop in `apply.rs`
+   with a single `syncfs` on the destination (plus parent-directory fsyncs so the atomic renames are
+   durable). Measured ~1.5× on small-file backups, and it closes a real durability gap. See the copy
+   sweep above.
+2. **Parallelism — settled.** The authentic copy sweep shows no benefit (it hurts); copies stay
+   sequential and `--jobs` (hashing only) stays default 1. No parallel copy stage.
