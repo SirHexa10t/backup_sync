@@ -55,6 +55,10 @@ pub struct Entry {
     pub mtime: Option<SystemTime>,
     /// Target of a symlink (only set when `kind == Symlink`).
     pub link_target: Option<PathBuf>,
+    /// Hard-link identity `(device, inode)` — set only for regular files with more than one name
+    /// (`nlink > 1`, unix). Entries sharing this value are the same file under different names.
+    /// Free to collect: it comes from the stat the scan already performs.
+    pub link_id: Option<(u64, u64)>,
 }
 
 /// A scanned tree: entries sorted by relative path.
@@ -76,6 +80,22 @@ impl Manifest {
     }
     pub fn iter(&self) -> impl Iterator<Item = &Entry> {
         self.entries.iter()
+    }
+
+    /// Hard-link groups: files sharing an inode, grouped, each group holding ≥2 members in
+    /// manifest (path-sorted) order. The first member of a group is its **leader** — the one
+    /// name whose content gets copied; the rest are followers, realized as hard links.
+    pub fn hardlink_groups(&self) -> Vec<Vec<&Entry>> {
+        let mut by_id: std::collections::HashMap<(u64, u64), Vec<&Entry>> =
+            std::collections::HashMap::new();
+        for e in self.entries.iter() {
+            if let Some(id) = e.link_id {
+                by_id.entry(id).or_default().push(e); // entries are sorted ⇒ groups are sorted
+            }
+        }
+        let mut groups: Vec<Vec<&Entry>> = by_id.into_values().filter(|g| g.len() >= 2).collect();
+        groups.sort_by(|a, b| a[0].rel.cmp(&b[0].rel));
+        groups
     }
 }
 

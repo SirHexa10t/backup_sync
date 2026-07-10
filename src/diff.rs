@@ -2,14 +2,20 @@
 //! unchanged. Move-detection pairs content-identical add/remove files (see `docs/theory.md`).
 //!
 //! Efficiency: only files whose size appears on *both* the add and remove sides ("contested") can
-//! be moves, so nothing else is ever hashed. Contested candidates are hashed in parallel, each at
-//! most once, then matched by content via a hash→queue map (which also handles duplicate content).
+//! be moves, so nothing else is ever hashed. Contested candidates are hashed each at most once,
+//! then matched by content via a hash→queue map (which also handles duplicate content).
+//!
+//! **Infallible by design**: one unreadable file must not abort the whole run (the same principle
+//! `apply` follows). Hash failures degrade safely — a move-candidate falls back to a plain
+//! copy/delete, an eager comparison falls back to "changed" (the copy will re-read and verify) —
+//! and every degradation is recorded in [`Diff::issues`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::hash;
+use crate::links;
 use crate::manifest::{DstRoot, Entry, Kind, Manifest, SrcRoot};
 
 /// A single-path difference, carrying the entry kind so the planner knows how to realize it.
@@ -27,6 +33,14 @@ pub struct Move {
     pub to: PathBuf,
 }
 
+/// A hard link to create at the destination: `name` becomes another name for `leader`'s inode —
+/// the content is written once (via the leader) and never copied for `name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub leader: PathBuf,
+    pub name: PathBuf,
+}
+
 /// The classified difference between a source and a destination tree.
 #[derive(Debug, Default)]
 pub struct Diff {
@@ -34,18 +48,29 @@ pub struct Diff {
     pub removed: Vec<Change>, // extra at dest, not in source → delete
     pub changed: Vec<Change>, // present on both sides but differing → update
     pub moved: Vec<Move>,     // content-identical relocation → rename at dest
+    /// Content-identical (hash-verified) but metadata drifted (mtime beyond tolerance) — realized
+    /// as a metadata refresh at the destination, never a re-copy.
+    pub touched: Vec<Change>,
+    /// Hard links to (re)create: follower names of source hard-link groups whose destination
+    /// linkage is missing, wrong, or invalidated by a leader re-copy.
+    pub to_link: Vec<Link>,
     pub unchanged: usize,
+    /// Files that couldn't be examined as intended (hash errors) — the classification degraded
+    /// safely instead of aborting the run. Callers should surface these.
+    pub issues: Vec<String>,
 }
 
 /// Classify `src` vs `dst`. `eager` compares files by content hash instead of size+mtime.
+/// `relative_symlinks` compares each destination link against the target a copy WOULD write
+/// ([`links::desired_target`]) — so a link already rewritten by a previous run is "unchanged".
 pub fn diff(
     src: &SrcRoot,
     src_m: &Manifest,
     dst: &DstRoot,
     dst_m: &Manifest,
     eager: bool,
-    jobs: usize,
-) -> std::io::Result<Diff> {
+    relative_symlinks: bool,
+) -> Diff {
     let dst_by_path: HashMap<&Path, &Entry> = dst_m.iter().map(|e| (e.rel.as_path(), e)).collect();
     let src_by_path: HashMap<&Path, &Entry> = src_m.iter().map(|e| (e.rel.as_path(), e)).collect();
 
@@ -53,7 +78,25 @@ pub fn diff(
     let mut add_files: Vec<&Entry> = Vec::new(); // file-only adds — candidates for move-detection
     let mut rm_files: Vec<&Entry> = Vec::new(); // file-only removes — the other side of a move
 
+    // Hard-link groups: the first name (path order) is the LEADER and carries the content through
+    // the normal copy/skip/move machinery below; the rest are FOLLOWERS, which are never copied —
+    // the linkage pass at the end decides which of them need a (re)link at the destination.
+    let groups = src_m.hardlink_groups();
+    let followers: HashSet<&Path> =
+        groups.iter().flat_map(|g| g[1..].iter().map(|e| e.rel.as_path())).collect();
+
     for se in src_m.iter() {
+        // A follower's content is its leader's business. Here we only make sure a wrong-kind
+        // occupant at the follower's destination path gets cleared; whether a link is needed is
+        // decided by the linkage pass.
+        if se.kind == Kind::File && followers.contains(se.rel.as_path()) {
+            if let Some(de) = dst_by_path.get(se.rel.as_path()) {
+                if de.kind != Kind::File {
+                    d.removed.push(Change { rel: de.rel.clone(), kind: de.kind });
+                }
+            }
+            continue;
+        }
         match dst_by_path.get(se.rel.as_path()) {
             // Same path, different kind (file↔dir↔symlink): not an in-place update. Treat it as
             // "delete the destination's version + add the source's" — the plan's delete-before-
@@ -70,13 +113,11 @@ pub fn diff(
                     d.removed.push(Change { rel: de.rel.clone(), kind: de.kind });
                 }
             }
-            Some(de) => {
-                if entries_equal(src, se, dst, de, eager)? {
-                    d.unchanged += 1;
-                } else {
-                    d.changed.push(Change { rel: se.rel.clone(), kind: se.kind });
-                }
-            }
+            Some(de) => match compare_entries(src, se, dst, de, eager, relative_symlinks, &mut d.issues) {
+                Verdict::Unchanged => d.unchanged += 1,
+                Verdict::Touched => d.touched.push(Change { rel: se.rel.clone(), kind: se.kind }),
+                Verdict::Changed => d.changed.push(Change { rel: se.rel.clone(), kind: se.kind }),
+            },
             None if se.kind == Kind::File => add_files.push(se),
             None => d.added.push(Change { rel: se.rel.clone(), kind: se.kind }),
         }
@@ -91,38 +132,132 @@ pub fn diff(
         }
     }
 
-    detect_moves(src, &add_files, dst, &rm_files, &mut d, jobs)?;
+    detect_moves(src, &add_files, dst, &rm_files, &mut d);
+
+    // Linkage pass. THE trap this must never fall into: a re-copied leader lands via atomic
+    // temp+rename, which creates a NEW destination inode — existing links at follower names keep
+    // pointing at the OLD inode and would silently serve stale bytes. So a follower needs a
+    // (re)link when its leader's destination inode will be new this run (added/changed/moved-in),
+    // OR when the destination doesn't currently hold both names on one inode.
+    let rewritten: HashSet<&Path> = d
+        .added
+        .iter()
+        .chain(d.changed.iter())
+        .map(|c| c.rel.as_path())
+        .chain(d.moved.iter().map(|m| m.to.as_path()))
+        .collect();
+    for group in &groups {
+        let leader = group[0];
+        let leader_rewritten = rewritten.contains(leader.rel.as_path());
+        let dst_leader_id = dst_by_path.get(leader.rel.as_path()).and_then(|e| e.link_id);
+        for f in &group[1..] {
+            let properly_linked = !leader_rewritten
+                && match (dst_by_path.get(f.rel.as_path()), dst_leader_id) {
+                    (Some(df), Some(lid)) => df.kind == Kind::File && df.link_id == Some(lid),
+                    _ => false,
+                };
+            if properly_linked {
+                d.unchanged += 1;
+            } else {
+                d.to_link.push(Link { leader: leader.rel.clone(), name: f.rel.clone() });
+            }
+        }
+    }
 
     d.added.sort_by(|a, b| a.rel.cmp(&b.rel));
     d.removed.sort_by(|a, b| a.rel.cmp(&b.rel));
     d.changed.sort_by(|a, b| a.rel.cmp(&b.rel));
+    d.touched.sort_by(|a, b| a.rel.cmp(&b.rel));
     d.moved.sort_by(|a, b| a.to.cmp(&b.to));
-    Ok(d)
+    d.to_link.sort_by(|a, b| a.name.cmp(&b.name));
+    d
 }
 
-fn entries_equal(
+enum Verdict {
+    Unchanged,
+    /// Content identical (hash-verified), metadata drifted — refresh, don't re-copy.
+    Touched,
+    Changed,
+}
+
+/// Same path, same kind: has the entry changed? Two safety properties baked in:
+/// - **Never destroy on a shallow signal.** Before a same-size file is declared changed on mtime
+///   alone (and its destination version overwritten), both sides are hashed. Identical content ⇒
+///   [`Verdict::Touched`] (metadata refresh, no write, nothing destroyed).
+/// - **Degrade, don't abort.** When content can't be compared (hash error), the verdict is
+///   Changed — copying is the safe direction — and the failure is recorded in `issues`.
+fn compare_entries(
     src: &SrcRoot,
     se: &Entry,
     dst: &DstRoot,
     de: &Entry,
     eager: bool,
-) -> std::io::Result<bool> {
+    relative_symlinks: bool,
+    issues: &mut Vec<String>,
+) -> Verdict {
     if se.kind != de.kind {
-        return Ok(false);
+        return Verdict::Changed;
     }
-    Ok(match se.kind {
-        Kind::Dir => true, // same path, both dirs — dir mtime churns, so don't call it a change
-        Kind::Symlink => se.link_target == de.link_target,
-        Kind::Other => false, // can't meaningfully compare specials → flag for attention
+    match se.kind {
+        Kind::Dir => Verdict::Unchanged, // dir metadata is aligned by apply, not classified here
+        Kind::Symlink => match (&se.link_target, &de.link_target) {
+            // compare against what a copy would WRITE, so rewritten links register as unchanged
+            (Some(st), Some(dt)) => {
+                if &links::desired_target(src, &se.rel, st, relative_symlinks) == dt {
+                    Verdict::Unchanged
+                } else {
+                    Verdict::Changed
+                }
+            }
+            (None, None) => Verdict::Unchanged,
+            _ => Verdict::Changed,
+        },
+        // Specials carry no copyable content — same kind at the same path means nothing to do.
+        Kind::Other => Verdict::Unchanged,
         Kind::File => {
-            if eager {
-                hash::hash_file(&src.path().join(&se.rel))?
-                    == hash::hash_file(&dst.path().join(&de.rel))?
-            } else {
-                se.size == de.size && mtime_close(se.mtime, de.mtime)
+            if se.size != de.size {
+                return Verdict::Changed; // different sizes can't be identical — no reads needed
+            }
+            let same_mtime = mtime_close(se.mtime, de.mtime);
+            if !eager && same_mtime {
+                return Verdict::Unchanged; // the fast path: size + mtime agree
+            }
+            // Same size but mtime drifted (or eager mode): decide by content.
+            let (sh, dh) = (
+                hash::hash_file(&src.path().join(&se.rel)),
+                hash::hash_file(&dst.path().join(&de.rel)),
+            );
+            match (sh, dh) {
+                (Ok(a), Ok(b)) if a == b => {
+                    if same_mtime {
+                        Verdict::Unchanged
+                    } else {
+                        Verdict::Touched // identical bytes; only the mtime needs aligning
+                    }
+                }
+                (Ok(_), Ok(_)) => {
+                    if same_mtime {
+                        // Only reachable in eager mode: content differs although size AND mtime
+                        // match — an mtime-preserving edit, or corruption on one side.
+                        issues.push(format!(
+                            "{}: content differs although size and mtime match — possible \
+                             corruption on one side (or an mtime-preserving edit); will re-copy \
+                             from the source",
+                            se.rel.display()
+                        ));
+                    }
+                    Verdict::Changed
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    issues.push(format!(
+                        "{}: cannot compare content ({e}); treating as changed",
+                        se.rel.display()
+                    ));
+                    Verdict::Changed
+                }
             }
         }
-    })
+    }
 }
 
 /// Treat mtimes within 2s as equal (tolerates coarse FAT/exFAT timestamps). If either side lacks
@@ -138,15 +273,15 @@ fn mtime_close(a: Option<SystemTime>, b: Option<SystemTime>) -> bool {
 }
 
 /// Pair content-identical adds (source) with removes (dest) — those are moves. Size pre-filter +
-/// parallel hashing of only the contested candidates + hash→queue matching (dup-content safe).
+/// hashing of only the contested candidates + hash→queue matching (dup-content safe). A candidate
+/// that can't be hashed simply isn't a move (falls back to plain copy/delete, with an issue).
 fn detect_moves(
     src: &SrcRoot,
     add_files: &[&Entry],
     dst: &DstRoot,
     rm_files: &[&Entry],
     d: &mut Diff,
-    jobs: usize,
-) -> std::io::Result<()> {
+) {
     let add_sizes: HashSet<u64> = add_files.iter().map(|e| e.size).collect();
     let rem_sizes: HashSet<u64> = rm_files.iter().map(|e| e.size).collect();
     let contested: HashSet<u64> = add_sizes.intersection(&rem_sizes).copied().collect();
@@ -157,8 +292,8 @@ fn detect_moves(
     let rem_cand: Vec<usize> =
         (0..rm_files.len()).filter(|&i| contested.contains(&rm_files[i].size)).collect();
 
-    let add_hashes = par_hash(src.path(), add_cand, add_files, jobs)?;
-    let rem_hashes = par_hash(dst.path(), rem_cand, rm_files, jobs)?;
+    let add_hashes = hash_candidates(src.path(), add_cand, add_files, &mut d.issues);
+    let rem_hashes = hash_candidates(dst.path(), rem_cand, rm_files, &mut d.issues);
 
     // content hash → queue of remove indices with that content (queue handles duplicate content)
     let mut by_hash: HashMap<[u8; 32], VecDeque<usize>> = HashMap::new();
@@ -188,21 +323,27 @@ fn detect_moves(
             d.removed.push(Change { rel: e.rel.clone(), kind: Kind::File });
         }
     }
-    Ok(())
 }
 
-/// Hash the given candidate files (by index into `files`) under `root`, using `jobs` threads.
-fn par_hash(
+/// Hash the candidate files (by index into `files`) under `root`. Failures don't propagate: the
+/// candidate is dropped from move-matching (→ plain copy/delete) and the error recorded.
+fn hash_candidates(
     root: &Path,
     cand: Vec<usize>,
     files: &[&Entry],
-    jobs: usize,
-) -> std::io::Result<Vec<(usize, [u8; 32])>> {
-    crate::parallel::map(jobs, cand, |i| {
-        hash::hash_file(&root.join(&files[i].rel)).map(|h| (i, *h.as_bytes()))
-    })
-    .into_iter()
-    .collect()
+    issues: &mut Vec<String>,
+) -> Vec<(usize, [u8; 32])> {
+    let mut out = Vec::with_capacity(cand.len());
+    for i in cand {
+        match hash::hash_file(&root.join(&files[i].rel)) {
+            Ok(h) => out.push((i, *h.as_bytes())),
+            Err(e) => issues.push(format!(
+                "{}: cannot hash for move-detection ({e}); treating as a plain copy/delete",
+                files[i].rel.display()
+            )),
+        }
+    }
+    out
 }
 
 impl Diff {
@@ -226,7 +367,11 @@ impl Diff {
         }
         let _ = writeln!(s, "to copy:   {}", self.added.len());
         for c in &self.added {
-            let _ = writeln!(s, "    + {}", c.rel.display());
+            if c.kind == Kind::Other {
+                let _ = writeln!(s, "    + {} (special file — no content; will be skipped)", c.rel.display());
+            } else {
+                let _ = writeln!(s, "    + {}", c.rel.display());
+            }
         }
         let _ = writeln!(s, "to delete: {}", self.removed.len());
         for c in &self.removed {
@@ -235,6 +380,14 @@ impl Diff {
         let _ = writeln!(s, "to update: {}", self.changed.len());
         for c in &self.changed {
             let _ = writeln!(s, "    * {}", c.rel.display());
+        }
+        let _ = writeln!(s, "to link:   {} (hard links — content written once via the leader)", self.to_link.len());
+        for l in &self.to_link {
+            let _ = writeln!(s, "    & {}  ->  {}", l.name.display(), l.leader.display());
+        }
+        let _ = writeln!(s, "to refresh (content identical, metadata drift): {}", self.touched.len());
+        for c in &self.touched {
+            let _ = writeln!(s, "    ≈ {}", c.rel.display());
         }
         let _ = writeln!(s, "unchanged: {}", self.unchanged);
         s

@@ -8,14 +8,14 @@ description = "Cheaply and reliably mirror one directory onto another"
 blake3 = "1.8.2"
 walkdir = "2.5.0"
 clap = { version = "4.5.53", features = ["derive"] }
-rayon = "1.11.0"
+indicatif = "0.17" # sync progress bar (auto-hides when stderr isn't a terminal)
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2" # posix_fadvise(DONTNEED) for cold-read verification
+libc = "0.2" # posix_fadvise(DONTNEED) for cold-read verification; syncfs durability barrier
 
 [dev-dependencies]
 tempfile = "3"
-indicatif = "0.17" # used by the usb_transfer benchmark
+rayon = "1.11.0" # worker-pool sweeps in the usb_transfer benchmark (prod code is sequential)
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2" # mkfifo(), to build a Kind::Other special file in tests

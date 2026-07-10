@@ -33,7 +33,10 @@ fn phases_are_ordered_rename_delete_createdir_copy() {
         ],
         changed: vec![Change { rel: p("edit.txt"), kind: Kind::File }],
         moved: vec![Move { from: p("was/x"), to: p("now/x") }],
+        touched: vec![],
+        to_link: vec![],
         unchanged: 3,
+        issues: vec![],
     };
     let a = plan(&d);
 
@@ -86,4 +89,30 @@ fn a_pure_move_is_a_single_rename() {
         ..Diff::default()
     };
     assert_eq!(plan(&d), vec![Action::Rename { from: p("old/name"), to: p("new/name") }]);
+}
+
+#[test]
+fn doomed_entries_at_a_move_target_are_deleted_before_the_rename() {
+    // dest currently has a DIRECTORY at "x" (with a child), both scheduled for deletion, while a
+    // detected move wants to rename "elsewhere" onto "x". The blocking subtree must be cleared
+    // first — children before parents — or the rename would fail with EISDIR.
+    let d = Diff {
+        moved: vec![Move { from: p("elsewhere"), to: p("x") }],
+        removed: vec![
+            Change { rel: p("x"), kind: Kind::Dir },
+            Change { rel: p("x/inner.txt"), kind: Kind::File },
+            Change { rel: p("unrelated_extra"), kind: Kind::File },
+        ],
+        ..Diff::default()
+    };
+    let a = plan(&d);
+
+    let del_child = pos(&a, &Action::Delete(p("x/inner.txt")));
+    let del_dir = pos(&a, &Action::Delete(p("x")));
+    let rn = pos(&a, &Action::Rename { from: p("elsewhere"), to: p("x") });
+    let del_other = pos(&a, &Action::Delete(p("unrelated_extra")));
+
+    assert!(del_child < del_dir, "blocking subtree: children before parents");
+    assert!(del_dir < rn, "the doomed dir must be gone before the rename lands");
+    assert!(rn < del_other, "unrelated deletes keep their usual place after renames");
 }

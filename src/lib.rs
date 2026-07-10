@@ -9,10 +9,13 @@
 pub mod apply;
 pub mod cli;
 pub mod diff;
+pub mod durability;
 pub mod hash;
+pub mod links;
+pub mod lock;
 pub mod manifest;
-pub mod parallel;
 pub mod plan;
+pub mod progress;
 pub mod report;
 pub mod scan;
 pub mod target;
@@ -40,62 +43,99 @@ pub fn run(cli: Cli) -> ExitCode {
 
     match &cli.command {
         Command::Diff(a) => {
-            let (src_m, src_errs) = scan::scan_with_errors(src.path());
-            let (dst_m, dst_errs) = scan::scan_with_errors(dst.path());
-            for e in src_errs.iter().chain(dst_errs.iter()) {
+            let s = scan::scan_with_errors(src.path());
+            let d = scan::scan_with_errors(dst.path());
+            for e in s.errors.iter().chain(d.errors.iter()) {
                 eprintln!("filesync diff: {e}");
             }
-            // Hashing is sequential — the --jobs flag was removed (no measured benefit).
-            match diff::diff(&src, &src_m, &dst, &dst_m, a.common.eager_checksum, 1) {
-                Ok(d) => {
-                    print!("{}", d.render());
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("filesync diff: {e}");
-                    ExitCode::FAILURE
-                }
+            for p in s.skipped_backup_dirs.iter().chain(d.skipped_backup_dirs.iter()) {
+                eprintln!("filesync diff: ignoring backup dir (has {}): {}", apply::BACKUP_MARKER, p.display());
             }
+            let (src_m, dst_m) = (s.manifest, d.manifest);
+            let d = diff::diff(
+                &src,
+                &src_m,
+                &dst,
+                &dst_m,
+                a.common.eager_checksum,
+                a.common.relative_symlinks,
+            );
+            for issue in &d.issues {
+                eprintln!("filesync diff: {issue}");
+            }
+            print!("{}", d.render());
+            ExitCode::SUCCESS
         }
         Command::Sync(a) => run_sync(&src, &dst, a),
     }
 }
 
 fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> ExitCode {
+    // Windows can't flush directory entries through std, so the default end-of-run barrier cannot
+    // make renames durable there — refuse rather than silently promise less (docs: durability.rs).
+    #[cfg(windows)]
+    if !a.fsync_each {
+        eprintln!(
+            "filesync sync: on Windows the default end-of-run durability barrier cannot persist \
+             renames — run with --fsync-each"
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // Resolve the report path first and refuse to place it inside either tree: inside the source
+    // it would write into a read-only tree (and get backed up as data); inside the destination the
+    // next run would mirror-delete it as an extra. This also covers the DEFAULT path when the
+    // current directory happens to be inside the source or destination.
+    let report_path = a
+        .common
+        .report
+        .clone()
+        .unwrap_or_else(|| report::default_report_path(src.path(), SystemTime::now()));
+    {
+        let rp = canonicalize_lenient(&report_path);
+        if fs::canonicalize(src.path()).is_ok_and(|cf| rp.starts_with(cf)) {
+            eprintln!(
+                "filesync sync: the report ({}) would be written inside the source, which is \
+                 read-only — run from a different directory or pass --report <path outside it>",
+                report_path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+        if rp.starts_with(canonicalize_lenient(dst.path())) {
+            eprintln!(
+                "filesync sync: the report ({}) would be written inside the destination — the \
+                 next run would delete it as an extra; pass --report <path outside it>",
+                report_path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
     if let Err(e) = fs::create_dir_all(dst.path()) {
         eprintln!("filesync sync: cannot create destination {}: {e}", dst.path().display());
         return ExitCode::FAILURE;
     }
 
-    // A backup dir must live on the same filesystem as the destination: files are moved aside with
-    // rename, which can't cross filesystems.
+    // One sync per destination: concurrent runs would sweep each other's staging files and plan
+    // from snapshots the other invalidates. Held (and auto-released) for the rest of this run.
+    let _lock = match lock::Lock::acquire(dst) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("filesync sync: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Validate the backup dir before mutating anything (see validate_backup_dir for the rules).
     if let Some(bdir) = &a.backup_dir {
-        match same_filesystem(bdir, dst.path()) {
-            Ok(true) => {}
-            Ok(false) => {
-                eprintln!(
-                    "filesync sync: --backup-dir must be on the same filesystem as the destination \
-                     (backup-dir={}, destination={})",
-                    bdir.display(),
-                    dst.path().display()
-                );
-                return ExitCode::FAILURE;
-            }
-            Err(e) => {
-                eprintln!("filesync sync: cannot check --backup-dir location: {e}");
-                return ExitCode::FAILURE;
-            }
+        if let Err(msg) = validate_backup_dir(bdir, src, dst) {
+            eprintln!("filesync sync: {msg}");
+            return ExitCode::FAILURE;
         }
     }
 
-    // Clean up any temp files a previous, interrupted run left behind.
-    let swept = apply::sweep_temp_files(dst);
-    if swept > 0 {
-        eprintln!("filesync: removed {swept} leftover temp file(s) from a previous run");
-    }
-
-    let (src_m, mut scan_errors) = scan::scan_with_errors(src.path());
-    if src_m.is_empty() {
+    let src_scan = scan::scan_with_errors(src.path());
+    if src_scan.manifest.is_empty() {
         eprintln!(
             "filesync sync: source {} is empty — refusing to mirror, which would delete everything \
              in the destination. If the source drive simply isn't mounted, mount it and retry; to \
@@ -104,44 +144,99 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    let (dst_m, dst_errors) = scan::scan_with_errors(dst.path());
-    scan_errors.extend(dst_errors);
+    // The destination scan also sweeps temp files a previous, interrupted run left behind.
+    let (dst_scan, swept) = scan::scan_destination(dst);
+    if swept > 0 {
+        eprintln!("filesync: removed {swept} leftover temp file(s) from a previous run");
+    }
+    for p in &dst_scan.skipped_backup_dirs {
+        eprintln!("filesync: ignoring backup dir at destination: {}", p.display());
+    }
+    let (src_m, dst_m) = (src_scan.manifest, dst_scan.manifest);
 
-    // Hashing is sequential — the --jobs flag was removed (no measured benefit; docs/theory.md).
-    let d = match diff::diff(src, &src_m, dst, &dst_m, a.common.eager_checksum, 1) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("filesync sync: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let d = diff::diff(src, &src_m, dst, &dst_m, a.common.eager_checksum, a.common.relative_symlinks);
 
-    let actions = plan::plan(&d);
     let opts = apply::Options {
         verify: !a.no_verify,
         fsync_each: a.fsync_each,
         backup_dir: a.backup_dir.clone(),
-        jobs: 1, // verify hashing is sequential (--jobs removed)
+        relative_symlinks: a.common.relative_symlinks,
     };
 
-    // Open the (streamed) report; fall back to in-memory if the file can't be created.
-    let report_path = a
-        .common
-        .report
-        .clone()
-        .unwrap_or_else(|| report::default_report_path(src.path(), SystemTime::now()));
+    // Open the (streamed) report — never truncating a previous one (sidestep name collisions) —
+    // and fall back to in-memory if the file can't be created.
+    let report_path = report::unique_path(&report_path);
     let mut report = report::Report::create(&report_path).unwrap_or_else(|e| {
         eprintln!("filesync sync: cannot open report {} ({e}); continuing without a report file", report_path.display());
         report::Report::new()
     });
 
-    // Record anything we couldn't read while scanning, up front, so an interrupted run still
-    // shows what was missed (its contents were omitted from the mirror).
-    for e in &scan_errors {
-        report.issue_msg(e.clone());
+    // Anything the diff couldn't examine as intended (it degraded safely instead of aborting).
+    for issue in &d.issues {
+        report.issue_msg(issue.clone());
     }
 
-    // Warn up front about destination limitations that will force skips.
+    // Record anything we couldn't read while scanning, up front, so an interrupted run still
+    // shows what was missed (its contents were omitted from the mirror).
+    for e in src_scan.errors.iter().chain(dst_scan.errors.iter()) {
+        report.issue_msg(e.clone());
+    }
+    for p in &src_scan.skipped_backup_dirs {
+        report.issue_msg(format!(
+            "source contains a filesync backup dir; its subtree is not mirrored: {} \
+             (delete its {} marker to include it)",
+            p.display(),
+            apply::BACKUP_MARKER
+        ));
+    }
+
+    let mut actions = plan::plan(&d);
+
+    // SAFETY VALVE: deletions are only trustworthy when the source was scanned COMPLETELY — a file
+    // invisible behind a read error would otherwise be classified "extra at destination" and
+    // deleted, destroying the (possibly last) copy. If any part of the source couldn't be read,
+    // suspend every deletion; copies and renames are additive/content-preserving and still run.
+    let src_view_incomplete =
+        !src_scan.errors.is_empty() || !src_scan.skipped_backup_dirs.is_empty();
+    if src_view_incomplete {
+        let deletes = actions.iter().filter(|x| matches!(x, plan::Action::Delete(_))).count();
+        // Hard-link updates can clear an existing destination name (a delete in disguise), so
+        // they're deferred too — the next fully-readable run performs them.
+        let links = actions.iter().filter(|x| matches!(x, plan::Action::HardLink { .. })).count();
+        actions.retain(|x| {
+            !matches!(x, plan::Action::Delete(_) | plan::Action::HardLink { .. })
+        });
+        if deletes > 0 {
+            report.issue_msg(format!(
+                "source was not fully readable — {deletes} deletion(s) suspended; nothing was \
+                 deleted this run. Fix the source (permissions/mount) and re-run."
+            ));
+        }
+        if links > 0 {
+            report.issue_msg(format!(
+                "{links} hard-link update(s) deferred until the source is fully readable"
+            ));
+        }
+
+        // Deletes normally free space before the copies run; with deletions suspended, look ahead
+        // instead of churning into a full disk: if the planned copies can't all fit, skip them too.
+        let needed = planned_copy_bytes(&actions, &src_m);
+        let needed_with_margin = needed + needed / 20 + 32 * 1024 * 1024; // ~5% + slack
+        if let Some(avail) = available_bytes(dst.path()) {
+            if avail < needed_with_margin {
+                let copies = actions.iter().filter(|x| matches!(x, plan::Action::Copy(_))).count();
+                actions.retain(|x| !matches!(x, plan::Action::Copy(_)));
+                report.issue_msg(format!(
+                    "insufficient free space for the {copies} planned copies while deletions are \
+                     suspended (need ~{} MiB, have {} MiB) — copies skipped this run",
+                    needed_with_margin / (1 << 20),
+                    avail / (1 << 20)
+                ));
+            }
+        }
+    }
+
+    // Warn up front about destination limitations that will force skips/fallbacks.
     let caps = target::probe(dst);
     if !caps.symlinks {
         let n = src_m.iter().filter(|e| e.kind == Kind::Symlink).count();
@@ -149,18 +244,27 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> ExitCode {
             report.issue_msg(format!("destination cannot store symlinks; {n} will be skipped"));
         }
     }
-
-    apply::apply(src, dst, &actions, &opts, &mut report);
-
-    // Post-sync: rewrite into-source symlinks to point inside the mirror (opt-in).
-    if a.relative_symlinks {
-        apply::relink_internal_symlinks(src, dst, &src_m, &mut report);
+    if !caps.hardlinks && !d.to_link.is_empty() {
+        // Content still lands (the apply stage falls back to independent copies) — the linkage
+        // is what's lost, so this is a note, not a failure.
+        report.skip_msg(format!(
+            "destination cannot hold hard links; {} linked name(s) will be copied as independent \
+             files",
+            d.to_link.len()
+        ));
     }
+
+    // Live progress for the long parts (bar = bytes to copy; auto-hidden off-terminal).
+    let prog = progress::Progress::for_sync(planned_copy_bytes(&actions, &src_m), actions.len() as u64);
+    apply::apply(src, dst, &src_m, &actions, &opts, &mut report, &prog);
+    prog.finish();
 
     report.finish();
 
     print!("{}", report.render());
-    println!("report: {}", report_path.display());
+    if report.has_file() {
+        println!("report: {}", report_path.display());
+    }
 
     if report.issues.is_empty() {
         ExitCode::SUCCESS
@@ -181,6 +285,18 @@ fn validate_roots(from: &Path, to: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot resolve --from {}: {e}", from.display()))?;
     let ct = canonicalize_lenient(to);
 
+    // Neither end may be the filesystem root. Mirroring FROM `/` would scan every mount —
+    // including the destination itself (self-nesting copies, mirror-deleting the previous backup)
+    // and pseudo-filesystems like /proc; mirroring ONTO `/` would mirror-delete everything
+    // outside the source.
+    if cf.parent().is_none() {
+        return Err("--from must not be the filesystem root (scanning / would descend into every \
+                    mount, including the destination itself)"
+            .to_string());
+    }
+    if ct.parent().is_none() {
+        return Err("--to must not be the filesystem root".to_string());
+    }
     if cf == ct {
         Err("--from and --to are the same directory".to_string())
     } else if ct.starts_with(&cf) {
@@ -200,29 +316,135 @@ fn validate_roots(from: &Path, to: &Path) -> Result<(), String> {
     }
 }
 
-/// Canonicalize `path`, tolerating a not-yet-created tail: resolve the deepest existing ancestor
-/// (following symlinks) and re-append the components that don't exist yet. This lets us compare a
-/// destination that hasn't been created against the source while still resolving any symlinks in
-/// its existing prefix.
-fn canonicalize_lenient(path: &Path) -> PathBuf {
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    let mut cur = path.to_path_buf();
-    loop {
-        if let Ok(resolved) = fs::canonicalize(&cur) {
-            let mut out = resolved;
-            for comp in tail.iter().rev() {
-                out.push(comp);
-            }
-            return out;
+/// Canonicalize `path`, tolerating a not-yet-created tail. Relative paths are resolved against the
+/// current directory first, so a relative argument can never dodge an overlap check. Then walk the
+/// path component by component: while components exist, resolve them for real (following symlinks,
+/// so `..` crosses a symlink the same way the kernel would); once a component doesn't exist, the
+/// rest is handled lexically (`.` dropped, `..` pops) — which matches what `create_dir_all` +
+/// path resolution will later do, because freshly created directories are never symlinks.
+pub(crate) fn canonicalize_lenient(path: &Path) -> PathBuf {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => path.to_path_buf(),
         }
-        match cur.file_name() {
-            Some(name) => {
-                tail.push(name.to_os_string());
-                cur.pop();
+    };
+
+    let mut out = PathBuf::new();
+    let mut exists = true; // flips off at the first component that can't be resolved
+    for comp in abs.components() {
+        use std::path::Component;
+        match comp {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push(std::path::MAIN_SEPARATOR_STR),
+            Component::CurDir => {}
+            // `out` is fully resolved up to here (canonicalized per component), so a lexical pop
+            // is the physical parent; in the nonexistent tail it matches future create_dir_all.
+            Component::ParentDir => {
+                out.pop();
             }
-            None => return path.to_path_buf(), // nothing resolvable — use as given
+            Component::Normal(c) => {
+                out.push(c);
+                if exists {
+                    match fs::canonicalize(&out) {
+                        Ok(resolved) => out = resolved,
+                        Err(_) => exists = false,
+                    }
+                }
+            }
         }
     }
+    out
+}
+
+/// Validate `--backup-dir` before anything is mutated. The rules, and why:
+/// 1. **Not overlapping the source** (either direction) — the backup dir receives *writes*; the
+///    source is strictly read-only, and the type wall can't see a raw backup path.
+/// 2. **Not the destination itself** — its marker would make the whole mirror invisible to scans.
+///    (A backup dir *inside* the destination is fine: it gets a [`apply::BACKUP_MARKER`] on first
+///    use, and scans skip marked dirs, so later runs never mirror, delete, or re-back-up it.)
+/// 3. **Fresh** — absent or an empty directory. Reusing a dir (marked from a previous run, or one
+///    holding unrelated data) invites silent collisions: `rename` would overwrite same-named
+///    entries in it. One run, one backup dir.
+/// 4. **Same filesystem as the destination** — move-aside uses `rename`, which can't cross devices.
+fn validate_backup_dir(bdir: &Path, src: &SrcRoot, dst: &DstRoot) -> Result<(), String> {
+    let cb = canonicalize_lenient(bdir);
+    let cf = fs::canonicalize(src.path())
+        .map_err(|e| format!("cannot resolve source {}: {e}", src.path().display()))?;
+    let cd = canonicalize_lenient(dst.path());
+
+    if cb.starts_with(&cf) || cf.starts_with(&cb) {
+        return Err(format!(
+            "--backup-dir must not overlap the source (backup-dir={}, source={})",
+            cb.display(),
+            cf.display()
+        ));
+    }
+    if cb == cd {
+        return Err("--backup-dir must not be the destination itself".to_string());
+    }
+    match fs::symlink_metadata(&cb) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // fresh — will be created on use
+        Err(e) => return Err(format!("cannot inspect --backup-dir {}: {e}", cb.display())),
+        Ok(md) if !md.is_dir() => {
+            return Err(format!("--backup-dir {} exists and is not a directory", cb.display()))
+        }
+        Ok(_) => match fs::read_dir(&cb) {
+            Err(e) => return Err(format!("cannot read --backup-dir {}: {e}", cb.display())),
+            Ok(mut rd) => {
+                if rd.next().is_some() {
+                    return Err(format!(
+                        "--backup-dir {} is not empty — each run needs a fresh backup dir \
+                         (a previous run's backups stay untouched; pick a new directory)",
+                        cb.display()
+                    ));
+                }
+            }
+        },
+    }
+    match same_filesystem(&cb, dst.path()) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!(
+            "--backup-dir must be on the same filesystem as the destination \
+             (backup-dir={}, destination={})",
+            cb.display(),
+            dst.path().display()
+        )),
+        Err(e) => Err(format!("cannot check --backup-dir location: {e}")),
+    }
+}
+
+/// Total bytes the planned `Copy` actions will write (source sizes; symlinks count as 0).
+fn planned_copy_bytes(actions: &[plan::Action], src_m: &manifest::Manifest) -> u64 {
+    let sizes: std::collections::HashMap<&Path, u64> =
+        src_m.iter().map(|e| (e.rel.as_path(), e.size)).collect();
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            plan::Action::Copy(rel) => sizes.get(rel.as_path()).copied(),
+            _ => None,
+        })
+        .sum()
+}
+
+/// Free bytes available to unprivileged writes on the filesystem holding `path` (unix `statvfs`);
+/// `None` when it can't be determined (then the caller proceeds without a space check).
+#[cfg(unix)]
+fn available_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some(st.f_bavail as u64 * st.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn available_bytes(_path: &Path) -> Option<u64> {
+    None
 }
 
 /// Whether `a` and `b` live on the same filesystem (device). Off-unix, device introspection isn't
@@ -296,6 +518,21 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_destination_root() {
+        let t = tempfile::tempdir().unwrap();
+        let err = validate_roots(t.path(), Path::new("/")).unwrap_err();
+        assert!(err.contains("filesystem root"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_rejects_source_root() {
+        let t = tempfile::tempdir().unwrap();
+        let err = validate_roots(Path::new("/"), t.path()).unwrap_err();
+        assert!(err.contains("--from must not be the filesystem root"), "{err}");
+    }
+
+    #[test]
     fn validate_rejects_destination_inside_source() {
         let t = tempfile::tempdir().unwrap();
         // destination need not exist yet — canonicalize_lenient resolves its existing prefix
@@ -351,5 +588,87 @@ mod tests {
     fn lenient_canonicalize_equals_canonicalize_when_present() {
         let t = tempfile::tempdir().unwrap();
         assert_eq!(canonicalize_lenient(t.path()), fs::canonicalize(t.path()).unwrap());
+    }
+
+    #[test]
+    fn lenient_canonicalize_resolves_relative_paths_against_cwd() {
+        // A relative, nonexistent path must not stay relative — that would dodge every
+        // starts_with overlap check (the `--to backup` bypass).
+        let out = canonicalize_lenient(Path::new("filesync-nonexistent-xyz/sub"));
+        let cwd = fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        assert!(out.is_absolute(), "must be absolutized: {out:?}");
+        assert_eq!(out, cwd.join("filesync-nonexistent-xyz").join("sub"));
+    }
+
+    #[test]
+    fn lenient_canonicalize_normalizes_dot_and_dotdot_in_missing_tail() {
+        let t = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(t.path()).unwrap();
+        assert_eq!(
+            canonicalize_lenient(&t.path().join("nope/../other/./x")),
+            base.join("other").join("x"),
+            "`..` and `.` in a not-yet-existing tail must be resolved lexically"
+        );
+    }
+
+    #[test]
+    fn backup_dir_inside_source_is_rejected() {
+        let t = tempfile::tempdir().unwrap();
+        let (s, d) = (t.path().join("src"), t.path().join("dst"));
+        fs::create_dir_all(&s).unwrap();
+        fs::create_dir_all(&d).unwrap();
+        let err = validate_backup_dir(&s.join("bk"), &SrcRoot::new(&s), &DstRoot::new(&d))
+            .unwrap_err();
+        assert!(err.contains("overlap the source"), "{err}");
+    }
+
+    #[test]
+    fn backup_dir_must_be_fresh() {
+        let t = tempfile::tempdir().unwrap();
+        let (s, d, bk) = (t.path().join("src"), t.path().join("dst"), t.path().join("bk"));
+        fs::create_dir_all(&s).unwrap();
+        fs::create_dir_all(&d).unwrap();
+        let (sr, dr) = (SrcRoot::new(&s), DstRoot::new(&d));
+
+        // absent → ok; empty → ok; non-empty → rejected
+        assert!(validate_backup_dir(&bk, &sr, &dr).is_ok(), "absent backup dir is fresh");
+        fs::create_dir(&bk).unwrap();
+        assert!(validate_backup_dir(&bk, &sr, &dr).is_ok(), "empty backup dir is fresh");
+        fs::write(bk.join("leftover"), b"x").unwrap();
+        let err = validate_backup_dir(&bk, &sr, &dr).unwrap_err();
+        assert!(err.contains("not empty"), "{err}");
+    }
+
+    #[test]
+    fn backup_dir_may_be_inside_destination_but_not_the_destination() {
+        let t = tempfile::tempdir().unwrap();
+        let (s, d) = (t.path().join("src"), t.path().join("dst"));
+        fs::create_dir_all(&s).unwrap();
+        fs::create_dir_all(&d).unwrap();
+        let (sr, dr) = (SrcRoot::new(&s), DstRoot::new(&d));
+        assert!(validate_backup_dir(&d.join(".trash"), &sr, &dr).is_ok(), "inside dst is fine");
+        let err = validate_backup_dir(&d, &sr, &dr).unwrap_err();
+        assert!(err.contains("destination itself"), "{err}");
+    }
+
+    #[test]
+    fn planned_copy_bytes_sums_only_copy_actions() {
+        use manifest::{Entry, Kind, Manifest};
+        let entry = |rel: &str, size: u64| Entry {
+            rel: PathBuf::from(rel),
+            kind: Kind::File,
+            size,
+            mtime: None,
+            link_target: None,
+            link_id: None,
+        };
+        let m = Manifest::from_sorted(vec![entry("a", 100), entry("b", 7)]);
+        let actions = vec![
+            plan::Action::Copy(PathBuf::from("a")),
+            plan::Action::Delete(PathBuf::from("x")),
+            plan::Action::Copy(PathBuf::from("b")),
+            plan::Action::Copy(PathBuf::from("not-in-manifest")),
+        ];
+        assert_eq!(planned_copy_bytes(&actions, &m), 107);
     }
 }

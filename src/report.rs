@@ -13,11 +13,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct Report {
     pub copied: u64,
     pub moved: u64,
+    /// Hard links created — another destination name for an already-copied inode (no data write).
+    pub linked: u64,
     pub deleted: u64,
+    /// Content-identical files whose metadata (mtime/permissions) was refreshed instead of
+    /// re-copying — the deep pre-overwrite check confirmed no bytes needed to move.
+    pub refreshed: u64,
     pub bytes_copied: u64,
-    /// Files/dirs that were skipped or failed and need the user's attention.
+    /// Things that went wrong or need the user's attention — these make the run exit non-zero.
     pub issues: Vec<String>,
-    /// When present, issues are streamed here (flushed each time) as they're recorded.
+    /// Things deliberately not done because there is nothing to do (special files have no
+    /// copyable content). Listed for transparency; they do NOT affect the exit code.
+    pub skipped: Vec<String>,
+    /// When present, issues/skips are streamed here (flushed each time) as they're recorded.
     sink: Option<BufWriter<File>>,
 }
 
@@ -27,12 +35,18 @@ impl Report {
         Self::default()
     }
 
-    /// Open `path` and stream the report to it as the run proceeds.
+    /// Open `path` and stream the report to it as the run proceeds. Refuses to overwrite an
+    /// existing file (`create_new`) — pick a free name with [`unique_path`] first.
     pub fn create(path: &Path) -> io::Result<Self> {
-        let mut sink = BufWriter::new(File::create(path)?);
-        writeln!(sink, "filesync report — in progress")?;
+        let mut sink = BufWriter::new(File::create_new(path)?);
+        writeln!(sink, "filesync report (issues stream below; final counts appear at the end)")?;
         sink.flush()?;
         Ok(Self { sink: Some(sink), ..Self::default() })
+    }
+
+    /// Whether this report is backed by a file (false = in-memory fallback).
+    pub fn has_file(&self) -> bool {
+        self.sink.is_some()
     }
 
     /// Record a failed operation on `path`.
@@ -49,25 +63,49 @@ impl Report {
         self.issues.push(msg);
     }
 
-    /// Append the final counts to the streamed file (issues were already streamed above them).
+    /// Record a benign skip — something with nothing to copy (streamed like issues, but marked
+    /// `~` and never affecting the exit code).
+    pub fn skip_msg(&mut self, msg: String) {
+        if let Some(sink) = self.sink.as_mut() {
+            let _ = writeln!(sink, "  ~ {msg}");
+            let _ = sink.flush();
+        }
+        self.skipped.push(msg);
+    }
+
+    /// Append the final counts to the streamed file (issues were already streamed above them),
+    /// plus a completion line — its absence marks a report cut short by an interruption.
     pub fn finish(&mut self) {
         let counts = self.counts();
         if let Some(sink) = self.sink.as_mut() {
             let _ = write!(sink, "\n{counts}");
+            let _ = writeln!(sink, "run completed");
             let _ = sink.flush();
         }
     }
 
     fn counts(&self) -> String {
         format!(
-            "copied:  {} ({} bytes)\nmoved:   {}\ndeleted: {}\nissues:  {}\n",
-            self.copied, self.bytes_copied, self.moved, self.deleted, self.issues.len()
+            "copied:  {} ({} bytes)\nmoved:   {}\nlinked:  {}\ndeleted: {}\nrefreshed: {}\nskipped: {}\nissues:  {}\n",
+            self.copied,
+            self.bytes_copied,
+            self.moved,
+            self.linked,
+            self.deleted,
+            self.refreshed,
+            self.skipped.len(),
+            self.issues.len()
         )
     }
 
-    /// Full summary for the terminal (counts + the issue list).
+    /// Full summary for the terminal (counts + skip and issue lists).
     pub fn render(&self) -> String {
         let mut s = self.counts();
+        for m in &self.skipped {
+            s.push_str("    ~ ");
+            s.push_str(m);
+            s.push('\n');
+        }
         for i in &self.issues {
             s.push_str("    ! ");
             s.push_str(i);
@@ -92,6 +130,28 @@ fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
         .collect()
+}
+
+/// A variant of `path` that doesn't exist yet: `path` itself, else `…-2`, `…-3`, … (before the
+/// extension). Keeps a same-minute re-run from silently truncating the previous run's report.
+/// After 100 collisions, gives up and returns the original (creation will then fail loudly).
+pub fn unique_path(path: &Path) -> PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = path.extension().map(|e| e.to_string_lossy().into_owned());
+    for n in 2..=100u32 {
+        let name = match &ext {
+            Some(ext) => format!("{stem}-{n}.{ext}"),
+            None => format!("{stem}-{n}"),
+        };
+        let candidate = path.with_file_name(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    path.to_path_buf()
 }
 
 /// Format a UTC unix timestamp as `YYYY-mm-DD_HHMM`.
@@ -148,5 +208,30 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("a.txt: bad"), "issue not on disk: {content}");
         assert!(content.contains("b.txt: worse"));
+        // an interrupted report is recognizable: no completion line
+        assert!(!content.contains("run completed"));
+    }
+
+    #[test]
+    fn finished_report_carries_a_completion_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("r.txt");
+        let mut r = Report::create(&path).unwrap();
+        r.finish();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("run completed"), "{content}");
+    }
+
+    #[test]
+    fn create_refuses_to_overwrite_and_unique_path_sidesteps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("r.txt");
+        std::fs::write(&path, b"previous run's report").unwrap();
+
+        assert!(Report::create(&path).is_err(), "an existing report must never be truncated");
+        let alt = unique_path(&path);
+        assert_eq!(alt, tmp.path().join("r-2.txt"));
+        assert!(Report::create(&alt).is_ok());
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous run's report", "original intact");
     }
 }

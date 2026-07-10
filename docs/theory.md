@@ -109,8 +109,13 @@ This is the architecture the findings point to, and it satisfies all three aims 
    *(serves aim 2: everything is physically on the device when we say "done".)*
 3. **Verify** — cold re-read every copied file, hash, compare to source; build a mismatch list.
    *(serves aim 1: byte-perfect result, actually checked.)*
-4. **Correct** — re-copy (and re-verify) any mismatches; repeat until clean or flagged.
-   *(serves aim 1 again: the result is guaranteed, not assumed.)*
+4. **Correct** — a copy that fails verification is reported and **removed from the destination**.
+   Crucially, a corrupt copy carries the source's size *and* mtime, so if left in place every
+   later quick-check run would call it "unchanged" forever; removed, the next run sees it as
+   missing and simply re-copies it — so a plain re-run always heals. (Corruption that a
+   `--no-verify` run let through is likewise healed by re-running with `--eager-checksum`, which
+   compares content instead of size+mtime — the initial run's flags never limit later repair.)
+   *(serves aim 1 again: the mirror never retains a file that looks synced but isn't.)*
 
 This delivers a reliable result (verify) **and** robust durability (end-sync) at low time and low
 flash wear — strictly better than `fsync-each`, which is slower, wears more, and doesn't verify.
@@ -123,6 +128,14 @@ for someone who wants every-file-durable-as-it-goes; `--no-verify` to skip the c
 - Copy only files that are **missing or changed**, deciding identity by **content hash, not name**.
 - Detect **moves** (same content, different path) and perform a **local rename** at the destination
   instead of re-copying — the single biggest speed and wear win.
+- Mirror **hard-link groups as hard links**: names sharing an inode at the source (detected for
+  free — the scan's stat already carries `dev`/`ino`/`nlink`) are written **once** via the group's
+  leader; the other names become destination hard links (metadata only). The one trap is handled
+  explicitly: a re-copied leader lands via atomic temp+rename, which creates a *new* inode — so a
+  leader rewrite forces every follower to be **relinked in the same run**, or they'd silently keep
+  serving the old bytes. Followers of a verified leader are verified by construction (same inode).
+- Overwrite only on **proven** difference: a same-size file whose mtime drifted is hash-compared
+  first; identical content gets a metadata refresh instead of a re-copy.
 - These are why writing is minimized to exactly what's necessary — the raison d'être of the tool.
 
 #### Move detection — the algorithm (core, always on — not a flag)
@@ -151,6 +164,51 @@ Cost/benefit: we spend a Destination read + a Source read on each size-matched c
 full Destination **write** — and writes are the slow, wearing operation (findings 1 & 3). The extra
 work is bounded to size-collision candidates, never the whole tree.
 
+### Source trust and reachability (aim 1 & 2)
+
+Two assumptions about the source are load-bearing, so they are stated (and enforced) explicitly:
+
+1. **The source must be fully readable.** Mirroring decides deletions by *absence*: a file the scan
+   couldn't see looks identical to a file the user deleted — and its destination twin might be the
+   last surviving copy. The scan itself is the reachability check (it visits every directory), so
+   no separate pre-pass is needed. **If the source scan reports any read error (or skips a marked
+   backup dir), every deletion is suspended for that run** — copies and renames still proceed
+   (they are additive/content-preserving), and the report says what was suspended and why.
+   Because deletions normally free space *before* the copies run, a suspended run also does a
+   **space look-ahead**: if the destination can't fit all planned copies, the copies are skipped
+   too rather than churning into a full disk.
+2. **The source is authoritative — filesync cannot tell a damaged file from an edited one.**
+   *Unreadable* damage (I/O errors) is caught by rule 1. *Silent* damage (a file that reads fine
+   but whose bytes rotted) is indistinguishable from a legitimate edit without prior knowledge —
+   i.e. a persisted known-good hash, which filesync deliberately doesn't keep (no tracking file).
+   The mitigations that DO exist, layered:
+   - **Never destroy on a shallow signal.** A same-size file whose mtime drifted is hash-compared
+     *before* its destination version is overwritten. Identical content ⇒ a metadata refresh
+     (`refreshed` in the report) — no write, nothing destroyed, and the next run is quiet again.
+   - **Hunt corruption with an `--eager-checksum` re-run.** After a completed (verified) backup,
+     the two trees are known-identical — so a later eager run finding "same size + same mtime +
+     different content" means bytes rotted on one side (or an mtime-preserving edit). That
+     signature is explicitly called out in the report, and the file is re-copied from the source.
+     It cannot say **which side** rotted — pair with `--backup-dir` so the destination's previous
+     version survives even if the source was the damaged side.
+
+### The backup dir is self-marking (`--backup-dir`)
+
+The natural place for a recovery folder is *inside the destination* (it must share the
+destination's filesystem, since move-aside uses `rename`). But a naive mirror would then destroy
+it on the next run: the backup dir isn't in the source, so its contents look like extras. So:
+
+- On first use, filesync drops a **marker file** (`.filesync-backup-dir`) into the backup dir.
+  **Scans skip marked directories entirely** — they are never mirrored, deleted, or re-backed-up.
+  (If a marked dir is found in the *source*, its subtree is skipped and reported — filesync's own
+  trash-cans aren't data to mirror; delete the marker to override.)
+- **One run, one backup dir**: a backup dir must be fresh (absent or empty). Reuse is refused —
+  `rename` into an already-populated backup dir would silently overwrite same-named entries from
+  the earlier run.
+- The backup dir must **not overlap the source** (it receives writes; the source is read-only —
+  and the compile-time type wall can't see a raw `--backup-dir` path, so this is checked at
+  startup), and must not *be* the destination itself.
+
 ### Robust procedure (aim 2)
 
 - **Source is strictly read-only** — enforced at compile time via distinct `SrcRoot`/`DstRoot`
@@ -163,7 +221,8 @@ work is bounded to size-collision candidates, never the whole tree.
 - **Mirror with early deletes** — the destination mirrors the source (no stale extras); deletions
   run *early* to free space on tight targets, and never against the source. There is **no
   interactive prompt** (filesync runs unattended) — preview with the `diff` command, and
-  `--backup-dir` makes deletions/overwrites recoverable.
+  `--backup-dir` makes deletions/overwrites recoverable. Deletions require a **complete** source
+  scan (see "Source trust and reachability" above) — an unreadable source suspends them all.
 - **`--eager-checksum`** opt-in to compare by content hash instead of the default size+mtime
   quick-check (with tolerance for coarse FAT/exFAT timestamps) — for a thorough check, or to never
   miss a same-size+mtime change.

@@ -83,16 +83,29 @@ fn hardlinks_appear_as_two_regular_files_with_equal_content() {
     let ho = filesync::hash::hash_file(&tmp.path().join(&orig.rel)).unwrap();
     let hl = filesync::hash::hash_file(&tmp.path().join(&link.rel)).unwrap();
     assert_eq!(ho, hl);
+
+    // and the scan captured their shared inode identity (free — same stat as size/mtime)
+    #[cfg(unix)]
+    {
+        assert!(orig.link_id.is_some(), "multi-name files carry a link id");
+        assert_eq!(orig.link_id, link.link_id, "both names resolve to one inode");
+        let single = m.iter().find(|e| e.rel == PathBuf::from("f1/b.txt")).unwrap();
+        assert_eq!(single.link_id, None, "single-name files carry none");
+        let groups = m.hardlink_groups();
+        assert_eq!(groups.len(), 1, "exactly one hard-link group in the corpus");
+        assert_eq!(groups[0][0].rel, PathBuf::from("hl/linked.txt"), "leader = first by path");
+        assert_eq!(groups[0][1].rel, PathBuf::from("hl/original.txt"));
+    }
 }
 
 #[test]
 fn scan_ignores_filesync_temp_files() {
     let tmp = tempfile::tempdir().unwrap();
     common::file(tmp.path(), "real.txt", b"x");
-    common::file(tmp.path(), ".filesync.tmp.123.foo", b"scratch"); // our own temp
+    common::file(tmp.path(), ".filesync_staging.tmp.123.foo", b"scratch"); // our own temp
     let r = rels(&scan(tmp.path()));
     assert!(r.iter().any(|p| p == "real.txt"));
-    assert!(!r.iter().any(|p| p.starts_with(".filesync.tmp.")), "temp file must be ignored: {r:?}");
+    assert!(!r.iter().any(|p| p.starts_with(".filesync_staging.tmp.")), "temp file must be ignored: {r:?}");
 }
 
 #[test]
@@ -117,16 +130,35 @@ fn scan_reports_an_unreadable_directory() {
     common::file(tmp.path(), "locked/secret.txt", b"hidden");
     common::set_no_perms(tmp.path(), "locked"); // can't list the directory's contents
 
-    let (m, errors) = filesync::scan::scan_with_errors(tmp.path());
+    let out = filesync::scan::scan_with_errors(tmp.path());
     common::restore_perms(tmp.path(), "locked"); // let the tempdir clean itself up
 
     // readable siblings are still scanned
-    assert!(rels(&m).iter().any(|p| p == "readable.txt"));
+    assert!(rels(&out.manifest).iter().any(|p| p == "readable.txt"));
     // the unreadable directory produced a reported error naming it (not a silent omission)
     assert!(
-        errors.iter().any(|e| e.contains("locked")),
-        "expected a scan error mentioning 'locked': {errors:?}"
+        out.errors.iter().any(|e| e.contains("locked")),
+        "expected a scan error mentioning 'locked': {:?}",
+        out.errors
     );
     // and its hidden contents were NOT silently pulled in
-    assert!(!rels(&m).iter().any(|p| p == "locked/secret.txt"));
+    assert!(!rels(&out.manifest).iter().any(|p| p == "locked/secret.txt"));
+}
+
+#[test]
+fn scan_skips_directories_marked_as_backup_dirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    common::file(tmp.path(), "keep.txt", b"real data");
+    common::file(tmp.path(), "trash/.filesync-backup-dir", b"marker"); // a used --backup-dir
+    common::file(tmp.path(), "trash/old/data.txt", b"moved-aside content");
+
+    let out = filesync::scan::scan_with_errors(tmp.path());
+    let r = rels(&out.manifest);
+    assert!(r.iter().any(|p| p == "keep.txt"));
+    assert!(
+        !r.iter().any(|p| p.starts_with("trash")),
+        "marked dir and all its contents must be invisible to scans: {r:?}"
+    );
+    assert_eq!(out.skipped_backup_dirs, vec![PathBuf::from("trash")], "and reported as skipped");
+    assert!(out.errors.is_empty());
 }

@@ -48,6 +48,13 @@ pub struct Common {
     /// Report file path. Default: ./filesync-report-<source>-<YYYY-mm-DD_HHMM>.txt
     #[arg(long, value_name = "PATH")]
     pub report: Option<PathBuf>,
+
+    /// Rewrite symlinks whose fully-resolved target lies inside the source (chained links and
+    /// `..` are seen through; the target need not exist) so they point at the mirrored location
+    /// inside the destination, as relative paths — a self-contained backup. Links resolving
+    /// outside the source are copied verbatim.
+    #[arg(long)]
+    pub relative_symlinks: bool,
 }
 
 #[derive(Args, Debug)]
@@ -70,16 +77,12 @@ pub struct SyncArgs {
     #[arg(long)]
     pub fsync_each: bool,
 
-    /// Move files that would be deleted or overwritten here, instead of erasing them. Must be on
-    /// the same filesystem as the destination.
+    /// Move files that would be deleted or overwritten here, instead of erasing them. Must be a
+    /// fresh directory (absent or empty) on the destination's filesystem, and not inside the
+    /// source — one backup dir per run. It may live inside the destination: filesync marks it
+    /// with a `.filesync-backup-dir` file and never mirrors, deletes, or re-backs-up marked dirs.
     #[arg(long, value_name = "DIR")]
     pub backup_dir: Option<PathBuf>,
-
-    /// Rewrite symlinks whose target is inside the source so they point at the mirrored location
-    /// inside the destination (as relative paths), making the backup self-contained. Links that
-    /// resolve outside the source are copied verbatim; broken links are copied and reported.
-    #[arg(long)]
-    pub relative_symlinks: bool,
 }
 
 impl Command {
@@ -109,7 +112,7 @@ mod tests {
                 assert_eq!(a.common.to, PathBuf::from("/b"));
                 assert!(a.common.eager_checksum && a.no_verify && a.fsync_each);
                 assert_eq!(a.backup_dir, Some(PathBuf::from("/trash")));
-                assert!(a.relative_symlinks);
+                assert!(a.common.relative_symlinks);
             }
             _ => panic!("expected sync"),
         }

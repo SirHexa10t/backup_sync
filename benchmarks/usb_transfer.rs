@@ -126,6 +126,24 @@ fn selected_profiles(total: u64) -> Vec<Profile> {
         .collect()
 }
 
+/// Map `f` over `items` — sequentially when `jobs <= 1`, else across a pool of exactly `jobs`
+/// worker threads, preserving input order. Lives here (not in the library): production filesync is
+/// sequential by measurement, and worker-count research is this benchmark's job.
+fn par_map<T, O, F>(jobs: usize, items: Vec<T>, f: F) -> Vec<O>
+where
+    T: Send,
+    O: Send,
+    F: Fn(T) -> O + Sync + Send,
+{
+    if jobs <= 1 {
+        return items.into_iter().map(f).collect();
+    }
+    match rayon::ThreadPoolBuilder::new().num_threads(jobs).build() {
+        Ok(pool) => pool.install(|| items.into_par_iter().map(&f).collect::<Vec<O>>()),
+        Err(_) => items.into_iter().map(f).collect(), // couldn't build a pool → run it directly
+    }
+}
+
 // ── drive resolution: a CLI arg is a filesystem label OR a directory path ─────
 
 /// A resolved drive: where it's mounted and an impersonal name for results.
@@ -732,7 +750,7 @@ fn phase_jobs(spec: &str) {
             let prog =
                 Progress::start(&format!("write {}/{}j", p.name, jobs), p.count * file_bytes, p.count);
             let t = Instant::now();
-            let results = filesync::parallel::map(jobs, (0..p.count).collect::<Vec<u64>>(), |i| {
+            let results = par_map(jobs, (0..p.count).collect::<Vec<u64>>(), |i| {
                 let seed = 0x9E3779B97F4A7C15 ^ file_bytes ^ i.wrapping_mul(0x2545F4914F6CDD1D);
                 write_one_buffered(&dir.join(format!("f_{i:06}")), file_bytes, seed, &prog)
             });
@@ -761,7 +779,7 @@ fn phase_jobs(spec: &str) {
                 files.len() as u64,
             );
             let t = Instant::now();
-            let _ = filesync::parallel::map(jobs, files.clone(), |f| {
+            let _ = par_map(jobs, files.clone(), |f| {
                 let h = filesync::hash::hash_file(&f).expect("hash file");
                 prog.add_bytes(file_bytes);
                 h
@@ -891,7 +909,7 @@ fn phase_copy_jobs(from_spec: &str, to_spec: &str) {
                 let prog =
                     Progress::start(&format!("copy {}/{}j", p.name, jobs), bytes, src_files.len() as u64);
                 let t = Instant::now();
-                let results = filesync::parallel::map(jobs, src_files.clone(), |sf| {
+                let results = par_map(jobs, src_files.clone(), |sf| {
                     let name = sf.file_name().expect("source file has a name");
                     copy_one(&sf, &dst_dir.join(name), false, false, &prog)
                 });

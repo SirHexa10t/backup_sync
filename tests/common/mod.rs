@@ -41,6 +41,12 @@ pub fn set_mtime(root: &Path, rel: &str, t: SystemTime) {
     File::options().write(true).open(root.join(rel)).unwrap().set_modified(t).unwrap();
 }
 
+/// Force a directory's modified-time — dirs can't be opened for writing, but a read handle is
+/// enough to set timestamps.
+pub fn set_dir_mtime(root: &Path, rel: &str, t: SystemTime) {
+    File::open(root.join(rel)).unwrap().set_modified(t).unwrap();
+}
+
 /// Does this filesystem support hard links? (Probes by trying, then cleans up.)
 pub fn hardlinks_supported(dir: &Path) -> bool {
     let (a, b) = (dir.join(".probe_hl_a"), dir.join(".probe_hl_b"));
