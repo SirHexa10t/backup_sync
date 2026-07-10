@@ -24,18 +24,18 @@ pub use cli::{Cli, Command};
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 use std::time::SystemTime;
 
 use manifest::{DstRoot, Kind, SrcRoot};
 
-/// Program entry point, called from `main`.
-pub fn run(cli: Cli) -> ExitCode {
+/// Program entry point, called from `main` — and by embedders (e.g. a shell-tool wrapper), which
+/// is why it returns a plain exit code (`0` = success) rather than the opaque `process::ExitCode`.
+pub fn run(cli: Cli) -> u8 {
     let common = cli.command.common();
 
     if let Err(msg) = validate_roots(&common.from, &common.to) {
         eprintln!("filesync: {msg}");
-        return ExitCode::FAILURE;
+        return 1;
     }
 
     let src = SrcRoot::new(&common.from);
@@ -64,13 +64,13 @@ pub fn run(cli: Cli) -> ExitCode {
                 eprintln!("filesync diff: {issue}");
             }
             print!("{}", d.render());
-            ExitCode::SUCCESS
+            0
         }
         Command::Sync(a) => run_sync(&src, &dst, a),
     }
 }
 
-fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> ExitCode {
+fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> u8 {
     // Windows can't flush directory entries through std, so the default end-of-run barrier cannot
     // make renames durable there — refuse rather than silently promise less (docs: durability.rs).
     #[cfg(windows)]
@@ -79,7 +79,7 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> ExitCode {
             "filesync sync: on Windows the default end-of-run durability barrier cannot persist \
              renames — run with --fsync-each"
         );
-        return ExitCode::FAILURE;
+        return 1;
     }
 
     // Resolve the report path first and refuse to place it inside either tree: inside the source
@@ -99,7 +99,7 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> ExitCode {
                  read-only — run from a different directory or pass --report <path outside it>",
                 report_path.display()
             );
-            return ExitCode::FAILURE;
+            return 1;
         }
         if rp.starts_with(canonicalize_lenient(dst.path())) {
             eprintln!(
@@ -107,13 +107,13 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> ExitCode {
                  next run would delete it as an extra; pass --report <path outside it>",
                 report_path.display()
             );
-            return ExitCode::FAILURE;
+            return 1;
         }
     }
 
     if let Err(e) = fs::create_dir_all(dst.path()) {
         eprintln!("filesync sync: cannot create destination {}: {e}", dst.path().display());
-        return ExitCode::FAILURE;
+        return 1;
     }
 
     // One sync per destination: concurrent runs would sweep each other's staging files and plan
@@ -122,7 +122,7 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> ExitCode {
         Ok(l) => l,
         Err(e) => {
             eprintln!("filesync sync: {e}");
-            return ExitCode::FAILURE;
+            return 1;
         }
     };
 
@@ -130,7 +130,7 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> ExitCode {
     if let Some(bdir) = &a.backup_dir {
         if let Err(msg) = validate_backup_dir(bdir, src, dst) {
             eprintln!("filesync sync: {msg}");
-            return ExitCode::FAILURE;
+            return 1;
         }
     }
 
@@ -142,7 +142,7 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> ExitCode {
              deliberately empty the destination, remove it yourself.",
             src.path().display()
         );
-        return ExitCode::FAILURE;
+        return 1;
     }
     // The destination scan also sweeps temp files a previous, interrupted run left behind.
     let (dst_scan, swept) = scan::scan_destination(dst);
@@ -267,9 +267,9 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> ExitCode {
     }
 
     if report.issues.is_empty() {
-        ExitCode::SUCCESS
+        0
     } else {
-        ExitCode::from(1)
+        1
     }
 }
 
