@@ -45,13 +45,15 @@ fn run_rejects_destination_inside_source() {
     common::file(&inner, "keep.txt", b"precious");
 
     let report_dir = tempfile::tempdir().unwrap();
-    let report_path = report_dir.path().join("r.txt");
 
-    let _ = run(sync_cli(outer.path(), &inner, Some(report_path.clone())));
+    let _ = run(sync_cli(outer.path(), &inner, Some(report_dir.path().to_path_buf())));
 
     // Rejected up front, before any work: no report was written, nothing was copied, and the
     // pre-existing destination content is untouched.
-    assert!(!report_path.exists(), "run should reject before creating a report");
+    assert!(
+        find_output(report_dir.path(), ".findings.txt").is_none(),
+        "run should reject before creating a report"
+    );
     assert!(!inner.join("inner").exists(), "no nested copy happened");
     assert_eq!(fs::read(inner.join("keep.txt")).unwrap(), b"precious");
 }
@@ -63,16 +65,18 @@ fn run_rejects_empty_source() {
     common::file(dst.path(), "existing.txt", b"keep me");
 
     let report_dir = tempfile::tempdir().unwrap();
-    let report_path = report_dir.path().join("r.txt");
 
-    let _ = run(sync_cli(src.path(), dst.path(), Some(report_path.clone())));
+    let _ = run(sync_cli(src.path(), dst.path(), Some(report_dir.path().to_path_buf())));
 
     // Refused before any deletion: the destination survives and no report was written.
     assert!(
         dst.path().join("existing.txt").is_file(),
         "an empty source must not wipe the destination"
     );
-    assert!(!report_path.exists(), "rejected before creating a report");
+    assert!(
+        find_output(report_dir.path(), ".findings.txt").is_none(),
+        "rejected before creating a report"
+    );
 }
 
 #[cfg(unix)]
@@ -89,13 +93,12 @@ fn run_writes_unreadable_directory_into_the_errors_file() {
     common::set_no_perms(src.path(), "vault");
 
     let report_dir = tempfile::tempdir().unwrap();
-    let report_path = report_dir.path().join("r.txt");
 
-    let _ = run(sync_cli(src.path(), dst.path(), Some(report_path.clone())));
+    let _ = run(sync_cli(src.path(), dst.path(), Some(report_dir.path().to_path_buf())));
     common::restore_perms(src.path(), "vault");
 
     // An unreadable directory is an issue → it lands in the companion errors file, labeled by side.
-    let errors = fs::read_to_string(filesync::report::errors_sibling(&report_path)).unwrap();
+    let errors = read_output(report_dir.path(), ".errors.txt");
     assert!(errors.contains("vault"), "errors file should name the unreadable dir:\n{errors}");
     assert!(errors.contains("source:"), "…and label its side:\n{errors}");
     assert!(dst.path().join("visible.txt").is_file(), "readable content still synced");
@@ -113,8 +116,7 @@ fn run_relative_symlinks_flag_retargets_into_source_links() {
     }
 
     let report_dir = tempfile::tempdir().unwrap();
-    let report_path = report_dir.path().join("r.txt");
-    let _ = run(mk_sync_cli(src.path(), dst.path(), Some(report_path), true, None));
+    let _ = run(mk_sync_cli(src.path(), dst.path(), Some(report_dir.path().to_path_buf()), true, None));
 
     let target = std::fs::read_link(dst.path().join("abs")).unwrap();
     assert!(
@@ -124,10 +126,26 @@ fn run_relative_symlinks_flag_retargets_into_source_links() {
     assert_eq!(std::fs::read(dst.path().join("abs")).unwrap(), b"payload");
 }
 
-/// A report path for tests that don't inspect the report — kept out of the project's CWD (where
-/// the default would land) so `cargo test` never litters the repo.
+/// An output directory for tests that don't inspect the report — kept out of the project's CWD
+/// (where the default would land) so `cargo test` never litters the repo. `--report` takes a dir.
 fn scratch_report(dir: &tempfile::TempDir) -> Option<PathBuf> {
-    Some(dir.path().join("report.txt"))
+    Some(dir.path().to_path_buf())
+}
+
+/// The single output file in `dir` whose name ends with `suffix` (e.g. `.findings.txt`), if any.
+/// Filenames are timestamped, so tests discover them by kind rather than hard-coding the name.
+fn find_output(dir: &Path, suffix: &str) -> Option<PathBuf> {
+    fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(suffix)))
+}
+
+/// Read the one output file of the given kind, panicking (with the dir listing) if it's missing.
+fn read_output(dir: &Path, suffix: &str) -> String {
+    let p = find_output(dir, suffix)
+        .unwrap_or_else(|| panic!("no {suffix} file in {:?}", fs::read_dir(dir).map(|r| r.count())));
+    fs::read_to_string(p).unwrap()
 }
 
 #[test]
@@ -151,9 +169,13 @@ fn run_rejects_report_inside_source() {
     let dst = tempfile::tempdir().unwrap();
     common::file(src.path(), "f.txt", b"data");
 
-    let _ = run(sync_cli(src.path(), dst.path(), Some(src.path().join("rep.txt"))));
+    // --report names a directory; the source itself lies inside the source → rejected up front.
+    let _ = run(sync_cli(src.path(), dst.path(), Some(src.path().to_path_buf())));
 
-    assert!(!src.path().join("rep.txt").exists(), "nothing may be written into the source");
+    assert!(
+        find_output(src.path(), ".findings.txt").is_none(),
+        "nothing may be written into the source"
+    );
     assert!(!dst.path().join("f.txt").exists(), "the run must be refused before copying");
 }
 
@@ -164,9 +186,9 @@ fn run_rejects_report_inside_destination() {
     let dst = tempfile::tempdir().unwrap();
     common::file(src.path(), "f.txt", b"data");
 
-    let _ = run(sync_cli(src.path(), dst.path(), Some(dst.path().join("rep.txt"))));
+    let _ = run(sync_cli(src.path(), dst.path(), Some(dst.path().to_path_buf())));
 
-    assert!(!dst.path().join("rep.txt").exists());
+    assert!(find_output(dst.path(), ".findings.txt").is_none());
     assert!(!dst.path().join("f.txt").exists(), "the run must be refused before copying");
 }
 
@@ -181,8 +203,7 @@ fn run_resumes_after_interrupted_copy_and_reports_counts() {
     common::file(dst.path(), "sub/.filesync_staging.tmp.7.b.txt", b"partial");
 
     let report_dir = tempfile::tempdir().unwrap();
-    let report_path = report_dir.path().join("r.txt");
-    let _ = run(sync_cli(src.path(), dst.path(), Some(report_path.clone())));
+    let _ = run(sync_cli(src.path(), dst.path(), Some(report_dir.path().to_path_buf())));
 
     // strays swept, real content copied
     assert!(!dst.path().join(".filesync_staging.tmp.4242.a.txt").exists());
@@ -191,12 +212,12 @@ fn run_resumes_after_interrupted_copy_and_reports_counts() {
     assert_eq!(fs::read(dst.path().join("sub/b.txt")).unwrap(), b"bbb");
 
     // the report carries the final counts with no issues …
-    let rep = fs::read_to_string(&report_path).unwrap();
+    let rep = read_output(report_dir.path(), ".findings.txt");
     assert!(rep.contains("copied:  2"), "report should count both copies:\n{rep}");
     assert!(rep.contains("issues:  0"), "no issues expected:\n{rep}");
     // … and a clean run leaves NO errors file at all
     assert!(
-        !filesync::report::errors_sibling(&report_path).exists(),
+        find_output(report_dir.path(), ".errors.txt").is_none(),
         "a clean run must not create an errors file"
     );
 }
@@ -221,8 +242,7 @@ fn unreadable_source_subtree_suspends_all_deletes() {
     common::set_no_perms(src.path(), "vault"); // source subtree becomes unreadable
 
     let report_dir = tempfile::tempdir().unwrap();
-    let report_path = report_dir.path().join("r.txt");
-    let _ = run(sync_cli(src.path(), dst.path(), Some(report_path.clone())));
+    let _ = run(sync_cli(src.path(), dst.path(), Some(report_dir.path().to_path_buf())));
     common::restore_perms(src.path(), "vault");
     // dir-metadata mirroring faithfully copied the 000 mode onto the destination's vault/ —
     // reopen it so the assertions (and the tempdir cleanup) can see inside.
@@ -240,10 +260,10 @@ fn unreadable_source_subtree_suspends_all_deletes() {
     // additive work still happened
     assert_eq!(fs::read(dst.path().join("ok.txt")).unwrap(), b"new content");
     // the report counts zero deletions …
-    let rep = fs::read_to_string(&report_path).unwrap();
+    let rep = read_output(report_dir.path(), ".findings.txt");
     assert!(rep.contains("deleted: 0"), "no deletions may be counted:\n{rep}");
     // … and the errors file states the suspension
-    let errors = fs::read_to_string(filesync::report::errors_sibling(&report_path)).unwrap();
+    let errors = read_output(report_dir.path(), ".errors.txt");
     assert!(
         errors.contains("suspended"),
         "errors file must state deletions were suspended:\n{errors}"
@@ -272,8 +292,7 @@ fn unreadable_source_file_suspends_deletes() {
     common::file(dst.path(), "unrelated_extra.txt", b"also must survive");
 
     let report_dir = tempfile::tempdir().unwrap();
-    let report_path = report_dir.path().join("r.txt");
-    let _ = run(sync_cli(src.path(), dst.path(), Some(report_path.clone())));
+    let _ = run(sync_cli(src.path(), dst.path(), Some(report_dir.path().to_path_buf())));
     common::restore_perms(src.path(), "renamed.bin");
 
     // no walkdir error occurred (the file was listable), yet ALL deletes are suspended:
@@ -282,9 +301,9 @@ fn unreadable_source_file_suspends_deletes() {
         "the move partner must NOT be deleted — it may be the only readable copy of that content"
     );
     assert!(dst.path().join("unrelated_extra.txt").is_file(), "every deletion is suspended");
-    let rep = fs::read_to_string(&report_path).unwrap();
+    let rep = read_output(report_dir.path(), ".findings.txt");
     assert!(rep.contains("deleted: 0"), "no deletions counted:\n{rep}");
-    let errors = fs::read_to_string(filesync::report::errors_sibling(&report_path)).unwrap();
+    let errors = read_output(report_dir.path(), ".errors.txt");
     assert!(errors.contains("suspended"), "errors file states deletions were suspended:\n{errors}");
     assert!(errors.contains("source:"), "the unreadable source file is reported, labeled:\n{errors}");
 }
@@ -377,9 +396,8 @@ fn diff_subprocess_streams_progress_and_writes_findings_and_errors_files() {
     common::file(dst.path(), "stale_extra.txt", b"would be deleted");
     common::set_no_perms(src.path(), "vault"); // source view becomes incomplete
 
-    // --report keeps both output files out of the repo (and exercises the diff report path).
+    // --report is a directory; it keeps the output files out of the repo (and exercises that path).
     let report_dir = tempfile::tempdir().unwrap();
-    let report_path = report_dir.path().join("d.txt");
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_filesync"))
         .args(["diff", "--from"])
@@ -387,7 +405,7 @@ fn diff_subprocess_streams_progress_and_writes_findings_and_errors_files() {
         .arg("--to")
         .arg(dst.path())
         .arg("--report")
-        .arg(&report_path)
+        .arg(report_dir.path())
         .output()
         .expect("run the filesync binary");
     common::restore_perms(src.path(), "vault");
@@ -408,10 +426,13 @@ fn diff_subprocess_streams_progress_and_writes_findings_and_errors_files() {
     assert!(out.status.success(), "diff is a preview — it exits 0");
 
     // the full per-file listing is in the findings file …
-    let findings = fs::read_to_string(&report_path).unwrap();
+    let findings = read_output(report_dir.path(), ".findings.txt");
     assert!(findings.contains("- stale_extra.txt"), "findings file lists the deletion:\n{findings}");
+    // … the conclusions file is always written …
+    let conclusions = read_output(report_dir.path(), ".conclusions.txt");
+    assert!(conclusions.contains("DATA-LOSS WATCH"), "conclusions written:\n{conclusions}");
     // … and the unreadable source dir is recorded, labeled, in the errors file
-    let errors = fs::read_to_string(filesync::report::errors_sibling(&report_path)).unwrap();
+    let errors = read_output(report_dir.path(), ".errors.txt");
     assert!(
         errors.contains("source:") && errors.contains("vault"),
         "errors file records the labeled source read failure:\n{errors}"
@@ -463,10 +484,9 @@ fn run_reports_special_files_as_skipped_not_issues() {
     }
 
     let report_dir = tempfile::tempdir().unwrap();
-    let report_path = report_dir.path().join("r.txt");
-    let _ = run(sync_cli(src.path(), dst.path(), Some(report_path.clone())));
+    let _ = run(sync_cli(src.path(), dst.path(), Some(report_dir.path().to_path_buf())));
 
-    let rep = fs::read_to_string(&report_path).unwrap();
+    let rep = read_output(report_dir.path(), ".findings.txt");
     assert!(rep.contains("skipped: 1"), "skip counted:\n{rep}");
     assert!(rep.contains("issues:  0"), "…without becoming an issue:\n{rep}");
     assert!(rep.contains("  ~ pipe"), "…and listed with the ~ marker:\n{rep}");

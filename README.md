@@ -22,7 +22,8 @@ Two things:
 And a cherry on top: **a report**. A normal copy just moves bytes silently; filesync tells you what
 actually happened — what was new, changed, or *moved*, and anything that needs your attention
 (files it had to skip, filesystem limits it hit, etc.). You get the fine details without having to
-sit and approve each file.
+sit and approve each file — and `diff` adds a **conclusions** file that flags the alarming parts up
+front, like a whole folder about to be deleted because it's no longer in the source.
 
 ## How it decides what to do
 
@@ -70,7 +71,8 @@ filesync sync --from ~/Documents --to /mnt/backup --backup-dir /mnt/backup/.tras
 | `--from <DIR>` | both | — (required) | Source directory. **Read-only** — never modified. |
 | `--to <DIR>` | both | — (required) | Destination directory. |
 | `--eager-checksum` | both | off | Compare by file **content** (blake3) instead of size+mtime. For a thorough check, or to never miss a same-size+same-mtime change. **Re-running with this flag after a completed backup is how you hunt corruption**: a verified mirror that now differs where size and mtime still match means bytes rotted on one side — filesync calls that signature out in the report and re-copies from the source (pair with `--backup-dir` so the destination's old version survives, in case the *source* was the rotten side). |
-| `--report <PATH>` | both | see below | Where to write the report. |
+| `--report <DIR>` | both | current dir | Existing directory to write this run's output files into (see [The report](#the-report)). Must be outside both trees. |
+| `--include-same` | `diff` | off | Also list content-identical files (needing neither copy nor move) in the findings. Off by default — the list can be enormous. |
 | `--no-verify` | `sync` | verify **on** | Skip re-reading each copied file to confirm it landed correctly. |
 | `--fsync-each` | `sync` | off | Force every file to disk individually (durable-as-you-go, but ~2–17× slower). Default is one flush at the end. |
 | `--backup-dir <DIR>` | `sync` | — | Move files that would be deleted or overwritten here, instead of erasing them. Must be a **fresh** dir (absent or empty) on the **destination's filesystem**, not inside the source — one backup dir per run. It may live inside the destination: filesync marks it with a `.filesync-backup-dir` file, and never mirrors, deletes, or re-backs-up a marked dir. |
@@ -103,33 +105,74 @@ target path recorded**, letting you reconstruct them later elsewhere.
 ## The report
 
 Every run writes its output to files in the current directory, so a huge listing never scrolls off
-the screen and live progress never bleeds into a redirected file. filesync routes its three kinds of
+the screen and live progress never bleeds into a redirected file. filesync routes its kinds of
 output by *meaning* — which shell redirection can't, since errors and progress would otherwise share
-stderr — into two files plus the terminal:
+stderr — into files plus the terminal. The files share one timestamped stem:
 
 ```
-./filesync-<command>-<source-folder-name>-<YYYY-mm-DD_HHMM>.txt          # the report / findings
-./filesync-<command>-<source-folder-name>-<YYYY-mm-DD_HHMM>.errors.txt   # issues — only if any
+./filesync-<command>-<source>-<YYYY-mm-DD_HHMM>.findings.txt      # what would change / did change
+./filesync-<command>-<source>-<YYYY-mm-DD_HHMM>.errors.txt        # issues — only if any
+./filesync-<command>-<source>-<YYYY-mm-DD_HHMM>.conclusions.txt   # diagnostics (diff only)
 ```
 
-(for example `filesync-sync-Documents-2026-07-04_1530.txt`). `<command>` is `sync` or `diff`:
+(for example `filesync-sync-Documents-2026-07-04_1530.findings.txt`). `<command>` is `sync` or `diff`:
 
-- The **report** holds the findings. `sync` records what it did (the counts, plus any benign skips);
-  `diff` writes the full new/changed/moved/deleted listing — however large — and prints only a
-  compact count summary to the screen.
+- The **findings** file is the report. `sync` records what it did (the counts, plus any benign
+  skips); `diff` writes the full new/changed/moved/deleted listing — however large — and prints only
+  a compact count summary to the screen. By default `diff` omits content-identical files (they're
+  counted, not listed); `--include-same` lists them too.
 - The **`.errors.txt`** companion holds anything needing your attention, one issue per line, each
   labeled with its side (`source:` / `destination:`). It's created **only if there's at least one
   issue** — so *no errors file means a clean run*.
-- **Live progress** (`… scanned …`) stays on the terminal only; it is never written to either file.
+- The **`.conclusions.txt`** file (written by `diff`) distils the diff into the few things worth
+  looking at — see [Conclusions](#conclusions) below.
+- **Live progress** (`… scanned …`) stays on the terminal only; it is never written to any file.
 
-`--report <PATH>` overrides the location (the `.errors.txt` companion follows its name). The path
-must lie **outside both trees**, and filesync refuses to start otherwise: inside the source it would
-write into a read-only tree, and inside the destination the next run would mirror-delete it. (This
-includes the default location — running from a directory inside the source or destination is caught
-too; run from elsewhere, or pass `--report`.) An existing report is never overwritten — a colliding
-name gets a `-2`/`-3` suffix. `sync` writes its report as the run progresses, so even an interrupted
-run leaves a usable record; a completed one ends with a `run completed` line, so a report cut short
-by an interruption is recognizable.
+`--report <DIR>` chooses the directory to write these files into (they keep their generated names);
+it must be an existing directory. The output directory must lie **outside both trees**, and filesync
+refuses to start otherwise: inside the source it would write into a read-only tree, and inside the
+destination the next run would mirror-delete the files. (This includes the default — running from a
+directory inside the source or destination is caught too; run from elsewhere, or pass `--report`.)
+An existing report is never overwritten — a same-minute re-run's stem gets a `-2`/`-3` suffix.
+`sync` writes its report as the run progresses, so even an interrupted run leaves a usable record; a
+completed one ends with a `run completed` line, so a report cut short by an interruption is
+recognizable.
+
+### Conclusions
+
+A full diff of a large tree is too much to read line by line — and the dangerous part (a backup
+folder that silently vanished from the source, about to be mirror-deleted) is easy to miss in it. So
+`diff` also writes a **conclusions** file that surfaces the meaningful few, loudest where data could
+be lost:
+
+- **Data-loss watch** — whole destination folders that are *entirely* absent from the source;
+  deletions whose name appears **nowhere** in the source (not a move — content that would simply be
+  gone); and the total deletion volume as a share of the destination, with a banner when it's large.
+- **Overview** — the counts with byte totals.
+- **Changes by top-level folder** — a table of adds/deletes/changes/moves and the net file and byte
+  change per folder, biggest losses first.
+- **Junk & system paths** — how many `.Trash-*`, `$RECYCLE.BIN`, `.DS_Store`, etc. entries are being
+  deleted from the destination or copied from the source.
+- **Extremes** — the largest single additions and deletions, and a breakdown of deletions by file
+  extension.
+
+## Stopping a run early
+
+A `sync` can take a long time. To stop one **gracefully** — without abandoning it mid-write — signal it:
+
+- **`Ctrl+C`** (interactive), or **`kill <pid>`** (from another terminal / a script; the PID is in
+  the destination's `.filesync.lock`).
+
+On the first signal filesync **finishes the file it's currently writing, then stops before the next
+one** — it doesn't start any further copies, renames, or deletes. It still runs the finalize over
+what it did: the durability flush and the verify pass, and a report that ends with
+`run stopped early by request — N of M planned action(s) done`. The run exits **non-zero**, because
+the mirror is incomplete — just re-run to finish (only the unfinished work is redone).
+
+Press **`Ctrl+C` again** (or signal again) to **abort immediately**, if you don't want to wait for a
+large in-flight file. That's a hard stop — safe too (writes are atomic and the run resumes), it just
+skips the clean finalize. On Windows, `Ctrl+C` is always this immediate stop (Unix signals aren't
+available there).
 
 ## Safety guarantees
 
@@ -145,6 +188,7 @@ by an interruption is recognizable.
   interruption can never leave a half-written file masquerading as a real one.
 - **Resumable** — a re-run re-compares and only redoes what didn't complete; no persistent state to
   corrupt.
+- **Stoppable** — a long `sync` can be ended early on demand (see [Stopping a run early](#stopping-a-run-early)); it finishes the in-flight file, flushes and verifies what it did, writes an honest report, and exits non-zero so nothing mistakes the partial mirror for a finished one.
 - **Verified, and corrected** — by default each copied file is re-read from the device and
   hash-checked against the source (`--no-verify` to skip). A copy that fails the check is reported
   and **removed** — a corrupt copy looks "unchanged" to later runs (same size and mtime), so leaving

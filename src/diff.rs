@@ -55,6 +55,10 @@ pub struct Diff {
     /// linkage is missing, wrong, or invalidated by a leader re-copy.
     pub to_link: Vec<Link>,
     pub unchanged: usize,
+    /// Relative paths of content-identical entries (needing neither a copy nor a move). Populated
+    /// only when the caller sets `include_same` — otherwise just `unchanged` is counted, since on a
+    /// large tree this list can dwarf every other category.
+    pub unchanged_paths: Vec<PathBuf>,
     /// Files that couldn't be examined as intended (hash errors) — the classification degraded
     /// safely instead of aborting the run. Each message names its side. Callers should surface them.
     pub issues: Vec<String>,
@@ -93,6 +97,7 @@ pub fn diff(
     dst_m: &Manifest,
     eager: bool,
     relative_symlinks: bool,
+    include_same: bool,
 ) -> Diff {
     let dst_by_path: HashMap<&Path, &Entry> = dst_m.iter().map(|e| (e.rel.as_path(), e)).collect();
     let src_by_path: HashMap<&Path, &Entry> = src_m.iter().map(|e| (e.rel.as_path(), e)).collect();
@@ -146,7 +151,12 @@ pub fn diff(
                 &mut d.issues,
                 &mut d.source_unreadable,
             ) {
-                Verdict::Unchanged => d.unchanged += 1,
+                Verdict::Unchanged => {
+                    d.unchanged += 1;
+                    if include_same {
+                        d.unchanged_paths.push(se.rel.clone());
+                    }
+                }
                 Verdict::Touched => d.touched.push(Change { rel: se.rel.clone(), kind: se.kind }),
                 Verdict::Changed => d.changed.push(Change { rel: se.rel.clone(), kind: se.kind }),
             },
@@ -190,6 +200,9 @@ pub fn diff(
                 };
             if properly_linked {
                 d.unchanged += 1;
+                if include_same {
+                    d.unchanged_paths.push(f.rel.clone());
+                }
             } else {
                 d.to_link.push(Link { leader: leader.rel.clone(), name: f.rel.clone() });
             }
@@ -202,6 +215,7 @@ pub fn diff(
     d.touched.sort_by(|a, b| a.rel.cmp(&b.rel));
     d.moved.sort_by(|a, b| a.to.cmp(&b.to));
     d.to_link.sort_by(|a, b| a.name.cmp(&b.name));
+    d.unchanged_paths.sort();
     d
 }
 
@@ -461,6 +475,13 @@ impl Diff {
             }
         }
         let _ = writeln!(s, "unchanged: {}", self.unchanged);
+        if detail {
+            // Only ever populated under --include-same; listed here so the exhaustive findings
+            // account for every entry, not just the ones that change.
+            for rel in &self.unchanged_paths {
+                let _ = writeln!(s, "    = {}", rel.display());
+            }
+        }
         s
     }
 }

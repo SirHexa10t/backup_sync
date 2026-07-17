@@ -8,9 +8,11 @@
 
 pub mod apply;
 pub mod cli;
+pub mod conclusions;
 pub mod diff;
 pub mod durability;
 pub mod hash;
+pub mod interrupt;
 pub mod links;
 pub mod lock;
 pub mod manifest;
@@ -43,9 +45,9 @@ pub fn run(cli: Cli) -> u8 {
 
     match &cli.command {
         Command::Diff(a) => {
-            // Resolve the findings file first and refuse to place it inside either tree (same rule
-            // as sync) — including the DEFAULT path when the current directory is inside one.
-            let report_path = match resolve_report_path("diff", &a.common.report, &src, &dst) {
+            // Resolve the output directory first and refuse to place it inside either tree (same
+            // rule as sync) — including the DEFAULT (current) directory.
+            let out_dir = match resolve_output_dir(&a.common.report, &src, &dst) {
                 Ok(p) => p,
                 Err(msg) => {
                     eprintln!("filesync diff: {msg}");
@@ -70,6 +72,7 @@ pub fn run(cli: Cli) -> u8 {
                 &dst_m,
                 a.common.eager_checksum,
                 a.common.relative_symlinks,
+                a.include_same,
             );
 
             // Everything that needs attention, each line naming its side — bound for the errors
@@ -107,44 +110,41 @@ pub fn run(cli: Cli) -> u8 {
                 )
             });
 
-            // Write the findings file (full classification), then the errors file if anything needs
-            // it. De-duplicate the name right before writing (a same-minute re-run must not clobber
-            // it); the errors file shares the resulting stem.
-            let report_path = report::unique_path(&report_path);
-            let errors_path = report::errors_sibling(&report_path);
-            let findings = format!(
-                "filesync diff — comparing {} -> {}\n\n{}",
-                src.path().display(),
-                dst.path().display(),
-                d.render(true)
-            );
-            let wrote_report = match write_fresh(&report_path, &findings) {
-                Ok(()) => true,
-                Err(e) => {
-                    eprintln!("filesync diff: cannot write findings to {} ({e})", report_path.display());
-                    false
-                }
-            };
+            // Build the (de-duplicated) output paths inside the chosen directory, then write the
+            // three files: the full findings, the conclusions (always), and the issues (only if
+            // any). A same-minute re-run gets a `-N` stem, so nothing is ever clobbered.
+            let paths = report::OutputPaths::build(&out_dir, "diff", src.path(), SystemTime::now());
+            let (src_disp, dst_disp) =
+                (src.path().display().to_string(), dst.path().display().to_string());
+
+            let findings =
+                format!("filesync diff — comparing {src_disp} -> {dst_disp}\n\n{}", d.render(true));
+            let wrote_report = write_diag(&paths.report, &findings, "findings");
+
+            let conclusions = conclusions::analyze(&d, &src_m, &dst_m).render(&src_disp, &dst_disp);
+            let wrote_conclusions = write_diag(&paths.conclusions, &conclusions, "conclusions");
+
             let mut wrote_errors = false;
             if !issues.is_empty() {
                 let body = format!("filesync diff issues (one per line)\n{}\n", issues.join("\n"));
-                match write_fresh(&errors_path, &body) {
-                    Ok(()) => wrote_errors = true,
-                    Err(e) => eprintln!("filesync diff: cannot write issues to {} ({e})", errors_path.display()),
-                }
+                wrote_errors = write_diag(&paths.errors, &body, "issues");
             }
 
-            // Terminal: the compact count summary and where the detail went — never the full dump.
+            // Terminal: the compact count summary, the suspension preview, and where the detail
+            // went — never the full dump.
             print!("{}", d.render(false));
             if let Some(note) = &suspend_note {
                 println!("{note}");
             }
             if wrote_report {
-                println!("findings: {}", report_path.display());
+                println!("{:<12} {}", "findings:", paths.report.display());
+            }
+            if wrote_conclusions {
+                println!("{:<12} {}", "conclusions:", paths.conclusions.display());
             }
             if !issues.is_empty() {
                 if wrote_errors {
-                    println!("issues: {} — see {}", issues.len(), errors_path.display());
+                    println!("{:<12} {}  ({} issue(s))", "issues:", paths.errors.display(), issues.len());
                 } else {
                     println!("issues: {}", issues.len());
                     for i in &issues {
@@ -170,9 +170,9 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> u8 {
         return 1;
     }
 
-    // Resolve the report path first and refuse to place it inside either tree (see
-    // resolve_report_path) — including the DEFAULT path when the current directory is inside one.
-    let report_path = match resolve_report_path("sync", &a.common.report, src, dst) {
+    // Resolve the output directory first and refuse to place it inside either tree (see
+    // resolve_output_dir) — including the DEFAULT (current) directory.
+    let out_dir = match resolve_output_dir(&a.common.report, src, dst) {
         Ok(p) => p,
         Err(msg) => {
             eprintln!("filesync sync: {msg}");
@@ -227,7 +227,9 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> u8 {
     }
     let (src_m, dst_m) = (src_scan.manifest, dst_scan.manifest);
 
-    let d = diff::diff(src, &src_m, dst, &dst_m, a.common.eager_checksum, a.common.relative_symlinks);
+    // include_same is a diff-only findings toggle; the sync planner never needs the unchanged list.
+    let d =
+        diff::diff(src, &src_m, dst, &dst_m, a.common.eager_checksum, a.common.relative_symlinks, false);
 
     let opts = apply::Options {
         verify: !a.no_verify,
@@ -236,14 +238,13 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> u8 {
         relative_symlinks: a.common.relative_symlinks,
     };
 
-    // Open the (streamed) report — never truncating a previous one (sidestep name collisions) —
+    // Open the (streamed) report — never truncating a previous one (the stem is de-duplicated) —
     // and fall back to in-memory if the file can't be created. The errors file (companion, opened
-    // lazily on the first issue) shares the de-duplicated stem.
-    let report_path = report::unique_path(&report_path);
-    let errors_path = report::errors_sibling(&report_path);
+    // lazily on the first issue) shares the stem.
+    let paths = report::OutputPaths::build(&out_dir, "sync", src.path(), SystemTime::now());
     let context = format!("sync {} -> {}", src.path().display(), dst.path().display());
-    let mut report = report::Report::create(&report_path, &errors_path, &context).unwrap_or_else(|e| {
-        eprintln!("filesync sync: cannot open report {} ({e}); continuing without a report file", report_path.display());
+    let mut report = report::Report::create(&paths.report, &paths.errors, &context).unwrap_or_else(|e| {
+        eprintln!("filesync sync: cannot open report {} ({e}); continuing without a report file", paths.report.display());
         report::Report::new()
     });
 
@@ -336,16 +337,21 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> u8 {
         ));
     }
 
+    // Arm the graceful-stop handlers just before the mutating phase: the first Ctrl+C (or a
+    // SIGTERM) stops after the current file and finalizes cleanly; a second aborts. The scanning
+    // above is read-only, so a stop there is just a plain (safe) abort — nothing to finalize.
+    interrupt::arm();
+
     // Live progress for the long parts (bar = bytes to copy; auto-hidden off-terminal).
     let prog = progress::Progress::for_sync(planned_copy_bytes(&actions, &src_m), actions.len() as u64);
-    apply::apply(src, dst, &src_m, &actions, &opts, &mut report, &prog);
+    apply::apply(src, dst, &src_m, &actions, &opts, &mut report, &prog, interrupt::global());
     prog.finish();
 
     report.finish();
 
     print!("{}", report.render());
     if report.has_file() {
-        println!("report: {}", report_path.display());
+        println!("report: {}", paths.report.display());
     }
     // Surface issues: point at the errors file if one was written, else inline (in-memory report,
     // or the errors file couldn't be opened) so they're never lost.
@@ -360,47 +366,69 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> u8 {
         }
     }
 
-    if report.issues.is_empty() {
+    // A requested early stop leaves the mirror incomplete → exit non-zero, like issues, so a script
+    // never mistakes it for a finished backup.
+    if report.issues.is_empty() && !report.was_stopped_early() {
         0
     } else {
         1
     }
 }
 
-/// Resolve where this run's report/findings file goes, and refuse to place it inside either tree:
-/// inside the read-only source it can't be written (and would be backed up as data); inside the
-/// destination the next sync would mirror-delete it as an extra. `command` (`sync`/`diff`) selects
-/// the default filename. Returns the resolved path — NOT yet de-duplicated; the caller runs
-/// [`report::unique_path`] right before creating the file, to minimize the collision window.
-fn resolve_report_path(
-    command: &str,
+/// Resolve the directory this run writes its output files into, and refuse to place it inside either
+/// tree: inside the read-only source it can't be written (and would be backed up as data); inside
+/// the destination the next sync would mirror-delete the files as extras. With no `--report`, output
+/// goes to the current directory; a `--report` argument must be an existing directory.
+fn resolve_output_dir(
     report: &Option<PathBuf>,
     src: &SrcRoot,
     dst: &DstRoot,
 ) -> Result<PathBuf, String> {
-    let report_path = report
-        .clone()
-        .unwrap_or_else(|| report::default_report_path(command, src.path(), SystemTime::now()));
-    let rp = canonicalize_lenient(&report_path);
-    if fs::canonicalize(src.path()).is_ok_and(|cf| rp.starts_with(cf)) {
+    let dir = match report {
+        Some(p) => {
+            if !p.is_dir() {
+                return Err(format!(
+                    "--report must be an existing directory to write the output files into: {}",
+                    p.display()
+                ));
+            }
+            p.clone()
+        }
+        None => std::env::current_dir()
+            .map_err(|e| format!("cannot determine the current directory for output files: {e}"))?,
+    };
+    let cdir = canonicalize_lenient(&dir);
+    if fs::canonicalize(src.path()).is_ok_and(|cf| cdir.starts_with(cf)) {
         return Err(format!(
-            "the {command} report ({}) would be written inside the source, which is read-only — \
-             run from a different directory or pass --report <path outside it>",
-            report_path.display()
+            "the output directory ({}) is inside the source, which is read-only — run from a \
+             different directory or pass --report <dir outside it>",
+            dir.display()
         ));
     }
-    if rp.starts_with(canonicalize_lenient(dst.path())) {
+    if cdir.starts_with(canonicalize_lenient(dst.path())) {
         return Err(format!(
-            "the {command} report ({}) would be written inside the destination — the next sync \
-             would delete it as an extra; pass --report <path outside it>",
-            report_path.display()
+            "the output directory ({}) is inside the destination — the next sync would delete the \
+             files as extras; pass --report <dir outside it>",
+            dir.display()
         ));
     }
-    Ok(report_path)
+    Ok(dir)
+}
+
+/// Write a `diff` diagnostic file, reporting (but never failing the run on) an I/O error. Returns
+/// whether the file was written. `label` names the file kind for the error message.
+fn write_diag(path: &Path, content: &str, label: &str) -> bool {
+    match write_fresh(path, content) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("filesync diff: cannot write {label} to {} ({e})", path.display());
+            false
+        }
+    }
 }
 
 /// Write `content` to a brand-new file at `path`, never overwriting (`create_new`). Used for the
-/// `diff` command's one-shot findings/errors files (sync streams its report incrementally instead).
+/// `diff` command's one-shot findings/conclusions/errors files (sync streams its report instead).
 fn write_fresh(path: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write;
     let mut f = fs::File::create_new(path)?;

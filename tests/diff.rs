@@ -18,7 +18,13 @@ fn run_diff(src: &Path, dst: &Path, eager: bool) -> Diff {
 fn run_diff_flag(src: &Path, dst: &Path, eager: bool, relative_symlinks: bool) -> Diff {
     let (s, d) = (SrcRoot::new(src), DstRoot::new(dst));
     let (sm, dm) = (scan(src), scan(dst));
-    diff(&s, &sm, &d, &dm, eager, relative_symlinks)
+    diff(&s, &sm, &d, &dm, eager, relative_symlinks, false)
+}
+
+fn run_diff_same(src: &Path, dst: &Path) -> Diff {
+    let (s, d) = (SrcRoot::new(src), DstRoot::new(dst));
+    let (sm, dm) = (scan(src), scan(dst));
+    diff(&s, &sm, &d, &dm, false, false, true)
 }
 
 fn dirs() -> (tempfile::TempDir, tempfile::TempDir) {
@@ -32,6 +38,28 @@ fn missing_file_is_added() {
     let r = run_diff(s.path(), d.path(), false);
     assert_eq!(r.added_paths(), vec![PathBuf::from("a.txt")]);
     assert!(r.removed.is_empty() && r.changed.is_empty() && r.moved.is_empty());
+}
+
+#[test]
+fn include_same_collects_and_lists_identical_files_only_on_demand() {
+    let (s, d) = dirs();
+    common::file(s.path(), "same.txt", b"identical");
+    common::file(d.path(), "same.txt", b"identical");
+    common::file(s.path(), "changed.txt", b"new"); // different size → a real change
+    common::file(d.path(), "changed.txt", b"old-and-longer");
+
+    // default: identical files are counted, never collected or rendered
+    let plain = run_diff(s.path(), d.path(), false);
+    assert_eq!(plain.unchanged, 1);
+    assert!(plain.unchanged_paths.is_empty(), "default must not collect the identical list");
+    assert!(!plain.render(true).contains("= same.txt"), "…and must not render it");
+
+    // --include-same: the identical file is collected and appears in the detailed findings only
+    let full = run_diff_same(s.path(), d.path());
+    assert_eq!(full.unchanged, 1);
+    assert_eq!(full.unchanged_paths, vec![PathBuf::from("same.txt")]);
+    assert!(full.render(true).contains("= same.txt"), "detail must list it");
+    assert!(!full.render(false).contains("= same.txt"), "the terminal summary never lists it");
 }
 
 #[test]

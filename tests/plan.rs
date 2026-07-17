@@ -36,6 +36,7 @@ fn phases_are_ordered_rename_delete_createdir_copy() {
         touched: vec![],
         to_link: vec![],
         unchanged: 3,
+        unchanged_paths: vec![],
         issues: vec![],
         source_unreadable: false,
     };

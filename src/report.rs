@@ -41,6 +41,9 @@ pub struct Report {
     errors_sink: Option<BufWriter<File>>,
     /// Set if the errors file couldn't be opened — the caller then surfaces issues on the terminal.
     errors_failed: bool,
+    /// Set when a graceful stop cut the run short: (actions performed, actions planned). Its
+    /// presence means the mirror is incomplete — the run exits non-zero and says so.
+    stopped_early: Option<(usize, usize)>,
 }
 
 impl Report {
@@ -52,7 +55,7 @@ impl Report {
     /// Open `report_path` and stream the report to it as the run proceeds. `errors_path` names the
     /// companion errors file (opened lazily on the first issue); `context` is a one-line
     /// description of the run recorded in the header (e.g. `sync /a → /b`). Refuses to overwrite an
-    /// existing report (`create_new`) — pick a free name with [`unique_path`] first.
+    /// existing report (`create_new`) — [`OutputPaths::build`] hands out a de-duplicated stem.
     pub fn create(report_path: &Path, errors_path: &Path, context: &str) -> io::Result<Self> {
         let mut sink = BufWriter::new(File::create_new(report_path)?);
         writeln!(sink, "filesync report — {context}")?;
@@ -113,6 +116,17 @@ impl Report {
         }
     }
 
+    /// Record that a graceful stop ended the run before all planned actions ran (so the mirror is
+    /// incomplete). Not an error — kept separate from `issues` and the errors file.
+    pub fn mark_stopped_early(&mut self, performed: usize, planned: usize) {
+        self.stopped_early = Some((performed, planned));
+    }
+
+    /// Whether the run was cut short by a requested stop.
+    pub fn was_stopped_early(&self) -> bool {
+        self.stopped_early.is_some()
+    }
+
     /// Record a benign skip — something with nothing to copy. Streamed to the report (marked `~`),
     /// never to the errors file, and never affecting the exit code.
     pub fn skip_msg(&mut self, msg: String) {
@@ -134,7 +148,18 @@ impl Report {
                     let _ = writeln!(sink, "{} issue(s) recorded in {}", self.issues.len(), file_name_of(p));
                 }
             }
-            let _ = writeln!(sink, "run completed");
+            match self.stopped_early {
+                Some((done, total)) => {
+                    let _ = writeln!(
+                        sink,
+                        "run stopped early by request — {done} of {total} planned action(s) done; \
+                         the mirror is incomplete, re-run to finish"
+                    );
+                }
+                None => {
+                    let _ = writeln!(sink, "run completed");
+                }
+            }
             let _ = sink.flush();
         }
         if let Some(s) = self.errors_sink.as_mut() {
@@ -165,31 +190,62 @@ impl Report {
             s.push_str(m);
             s.push('\n');
         }
+        if let Some((done, total)) = self.stopped_early {
+            s.push_str(&format!(
+                "STOPPED EARLY by request — {done}/{total} actions done; re-run to finish\n"
+            ));
+        }
         s
     }
 }
 
-/// `./filesync-<command>-<source-folder-name>-<YYYY-mm-DD_HHMM>.txt` (UTC), in the current
-/// directory. `command` is `sync` or `diff`, so a diff and a sync of the same source don't collide.
-pub fn default_report_path(command: &str, src_root: &Path, now: SystemTime) -> PathBuf {
+/// The set of output files a run writes, all sharing one stem inside the output directory:
+/// `filesync-<command>-<source>-<YYYY-mm-DD_HHMM>.<kind>.txt`. `conclusions` is used only by `diff`.
+#[derive(Debug, Clone)]
+pub struct OutputPaths {
+    pub report: PathBuf,
+    pub errors: PathBuf,
+    pub conclusions: PathBuf,
+}
+
+impl OutputPaths {
+    /// Build the output paths for `command` inside `dir`, de-duplicating the stem so a same-minute
+    /// re-run never truncates the previous one (it checks the `.findings.txt` file). `command` is
+    /// `sync` or `diff`, so a diff and a sync of the same source don't collide.
+    pub fn build(dir: &Path, command: &str, src_root: &Path, now: SystemTime) -> Self {
+        let stem = unique_stem(dir, &raw_stem(command, src_root, now));
+        let f = |kind: &str| dir.join(format!("{stem}.{kind}.txt"));
+        Self { report: f("findings"), errors: f("errors"), conclusions: f("conclusions") }
+    }
+}
+
+/// `filesync-<command>-<source-folder-name>-<YYYY-mm-DD_HHMM>` (UTC) — the shared filename stem,
+/// without directory or extension.
+fn raw_stem(command: &str, src_root: &Path, now: SystemTime) -> String {
     let name = src_root
         .file_name()
         .map(|n| sanitize(&n.to_string_lossy()))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "root".to_string());
     let secs = now.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    PathBuf::from(format!("filesync-{command}-{name}-{}.txt", timestamp_utc(secs)))
+    format!("filesync-{command}-{name}-{}", timestamp_utc(secs))
 }
 
-/// The companion errors-file path for a report path: `foo.txt` → `foo.errors.txt` (the `.errors`
-/// is inserted before the final extension). Deriving it from the report path — after [`unique_path`]
-/// has run — keeps the pair sharing one stem, so they sort adjacently and stay obviously paired.
-pub fn errors_sibling(report_path: &Path) -> PathBuf {
-    let stem = report_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    match report_path.extension() {
-        Some(ext) => report_path.with_file_name(format!("{stem}.errors.{}", ext.to_string_lossy())),
-        None => report_path.with_file_name(format!("{stem}.errors")),
+/// A stem whose `<stem>.findings.txt` doesn't yet exist in `dir`: the stem itself, else `…-2`,
+/// `…-3`, … Keeps a same-minute re-run from colliding with the previous run's files. After 100
+/// collisions, returns the last try (creation then fails loudly rather than truncating anything).
+fn unique_stem(dir: &Path, stem: &str) -> String {
+    let taken = |candidate: &str| dir.join(format!("{candidate}.findings.txt")).exists();
+    if !taken(stem) {
+        return stem.to_string();
     }
+    for n in 2..=100u32 {
+        let candidate = format!("{stem}-{n}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+    stem.to_string()
 }
 
 fn file_name_of(path: &Path) -> String {
@@ -200,28 +256,6 @@ fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
         .collect()
-}
-
-/// A variant of `path` that doesn't exist yet: `path` itself, else `…-2`, `…-3`, … (before the
-/// extension). Keeps a same-minute re-run from silently truncating the previous run's report.
-/// After 100 collisions, gives up and returns the original (creation will then fail loudly).
-pub fn unique_path(path: &Path) -> PathBuf {
-    if !path.exists() {
-        return path.to_path_buf();
-    }
-    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let ext = path.extension().map(|e| e.to_string_lossy().into_owned());
-    for n in 2..=100u32 {
-        let name = match &ext {
-            Some(ext) => format!("{stem}-{n}.{ext}"),
-            None => format!("{stem}-{n}"),
-        };
-        let candidate = path.with_file_name(name);
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    path.to_path_buf()
 }
 
 /// Format a UTC unix timestamp as `YYYY-mm-DD_HHMM`.
@@ -257,32 +291,40 @@ mod tests {
     }
 
     #[test]
-    fn default_path_uses_command_and_source_name_and_is_impersonal() {
-        let p = default_report_path(
-            "sync",
+    fn output_paths_share_a_stem_named_by_command_and_source() {
+        let p = OutputPaths::build(
+            Path::new("/out"),
+            "diff",
             Path::new("/home/someone/My Docs"),
             UNIX_EPOCH + Duration::from_secs(1_609_459_200),
         );
-        assert_eq!(p, PathBuf::from("filesync-sync-My_Docs-2021-01-01_0000.txt"));
+        let stem = "/out/filesync-diff-My_Docs-2021-01-01_0000";
+        assert_eq!(p.report, PathBuf::from(format!("{stem}.findings.txt")));
+        assert_eq!(p.errors, PathBuf::from(format!("{stem}.errors.txt")));
+        assert_eq!(p.conclusions, PathBuf::from(format!("{stem}.conclusions.txt")));
     }
 
     #[test]
-    fn errors_sibling_shares_the_report_stem() {
-        assert_eq!(
-            errors_sibling(Path::new("filesync-diff-Docs-2021-01-01_0000.txt")),
-            PathBuf::from("filesync-diff-Docs-2021-01-01_0000.errors.txt")
-        );
-        // after unique_path added a `-2`, the errors file follows the same stem
-        assert_eq!(errors_sibling(Path::new("r-2.txt")), PathBuf::from("r-2.errors.txt"));
-        // no extension → append `.errors`
-        assert_eq!(errors_sibling(Path::new("report")), PathBuf::from("report.errors"));
+    fn build_dedups_the_stem_when_findings_already_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(1_609_459_200);
+        let first = OutputPaths::build(tmp.path(), "sync", Path::new("/x/src"), now);
+        std::fs::write(&first.report, b"a prior run's findings").unwrap();
+
+        // same minute → the stem gains a `-2` so the prior findings file is never clobbered …
+        let second = OutputPaths::build(tmp.path(), "sync", Path::new("/x/src"), now);
+        assert_ne!(second.report, first.report);
+        assert!(second.report.to_string_lossy().ends_with("-2.findings.txt"), "{:?}", second.report);
+        // … and the whole trio stays on that one deduped stem
+        assert!(second.errors.to_string_lossy().ends_with("-2.errors.txt"));
+        assert!(second.conclusions.to_string_lossy().ends_with("-2.conclusions.txt"));
     }
 
     #[test]
     fn issues_are_streamed_to_the_errors_file_before_finish() {
         let tmp = tempfile::tempdir().unwrap();
-        let report = tmp.path().join("r.txt");
-        let errors = errors_sibling(&report);
+        let report = tmp.path().join("r.findings.txt");
+        let errors = tmp.path().join("r.errors.txt");
         {
             let mut r = Report::create(&report, &errors, "test").unwrap();
             r.issue_msg("a.txt: bad".into());
@@ -290,8 +332,7 @@ mod tests {
             // dropped here WITHOUT finish() — simulating an interruption
         }
         let e = std::fs::read_to_string(&errors).unwrap();
-        assert!(e.contains("a.txt: bad"), "issue not on disk: {e}");
-        assert!(e.contains("b.txt: worse"));
+        assert!(e.contains("a.txt: bad") && e.contains("b.txt: worse"), "issue not on disk: {e}");
         // issues live in the errors file, not the report — and an interrupted report has no
         // completion line
         let rep = std::fs::read_to_string(&report).unwrap();
@@ -304,8 +345,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
 
         // clean run: report written, NO errors file
-        let clean = tmp.path().join("clean.txt");
-        let clean_err = errors_sibling(&clean);
+        let clean = tmp.path().join("clean.findings.txt");
+        let clean_err = tmp.path().join("clean.errors.txt");
         {
             let mut r = Report::create(&clean, &clean_err, "clean").unwrap();
             r.finish();
@@ -315,14 +356,13 @@ mod tests {
         assert!(Report::create(&clean, &clean_err, "x").is_err(), "report is create_new");
 
         // run with an issue: errors file exists, report points at it
-        let dirty = tmp.path().join("dirty.txt");
-        let dirty_err = errors_sibling(&dirty);
+        let dirty = tmp.path().join("dirty.findings.txt");
+        let dirty_err = tmp.path().join("dirty.errors.txt");
         {
             let mut r = Report::create(&dirty, &dirty_err, "dirty").unwrap();
             r.issue_msg("something: broke".into());
             r.finish();
         }
-        assert!(dirty_err.exists(), "an issue must create the errors file");
         assert!(std::fs::read_to_string(&dirty_err).unwrap().contains("something: broke"));
         let rep = std::fs::read_to_string(&dirty).unwrap();
         assert!(rep.contains("recorded in dirty.errors.txt"), "report must point at the errors file:\n{rep}");
@@ -331,26 +371,9 @@ mod tests {
     #[test]
     fn finished_report_carries_a_completion_line() {
         let tmp = tempfile::tempdir().unwrap();
-        let report = tmp.path().join("r.txt");
-        let mut r = Report::create(&report, &errors_sibling(&report), "ctx").unwrap();
+        let report = tmp.path().join("r.findings.txt");
+        let mut r = Report::create(&report, &tmp.path().join("r.errors.txt"), "ctx").unwrap();
         r.finish();
-        let content = std::fs::read_to_string(&report).unwrap();
-        assert!(content.contains("run completed"), "{content}");
-    }
-
-    #[test]
-    fn create_refuses_to_overwrite_and_unique_path_sidesteps() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("r.txt");
-        std::fs::write(&path, b"previous run's report").unwrap();
-
-        assert!(
-            Report::create(&path, &errors_sibling(&path), "x").is_err(),
-            "an existing report must never be truncated"
-        );
-        let alt = unique_path(&path);
-        assert_eq!(alt, tmp.path().join("r-2.txt"));
-        assert!(Report::create(&alt, &errors_sibling(&alt), "x").is_ok());
-        assert_eq!(std::fs::read(&path).unwrap(), b"previous run's report", "original intact");
+        assert!(std::fs::read_to_string(&report).unwrap().contains("run completed"));
     }
 }

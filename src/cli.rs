@@ -45,11 +45,12 @@ pub struct Common {
     #[arg(long)]
     pub eager_checksum: bool,
 
-    /// Where to write this run's report. Default:
-    /// ./filesync-<command>-<source>-<YYYY-mm-DD_HHMM>.txt in the current directory. Any issues go
-    /// to a sibling <name>.errors.txt (created only if there are any). Live progress stays on the
-    /// terminal, never in these files. The path must be outside both the source and destination.
-    #[arg(long, value_name = "PATH")]
+    /// Directory to write this run's output files into: the report (findings), plus — only if
+    /// there are any — an errors file, and (for `diff`) a conclusions file. They are named
+    /// filesync-<command>-<source>-<YYYY-mm-DD_HHMM>.<findings|errors|conclusions>.txt. Default: the
+    /// current directory. Must already exist and lie outside both the source and the destination.
+    /// Live progress stays on the terminal, never in these files.
+    #[arg(long, value_name = "DIR")]
     pub report: Option<PathBuf>,
 
     /// Rewrite symlinks whose fully-resolved target lies inside the source (chained links and
@@ -64,6 +65,11 @@ pub struct Common {
 pub struct DiffArgs {
     #[command(flatten)]
     pub common: Common,
+
+    /// Also list every content-identical file (one needing neither a copy nor a move) in the
+    /// findings. Off by default — on a large tree this list can be enormous.
+    #[arg(long)]
+    pub include_same: bool,
 }
 
 #[derive(Args, Debug)]
@@ -126,6 +132,24 @@ mod tests {
         let cli = Cli::try_parse_from(["filesync", "diff", "--from", "/a", "--to", "/b"]).unwrap();
         assert!(matches!(cli.command, Command::Diff(_)));
         assert!(!cli.command.common().eager_checksum);
+    }
+
+    #[test]
+    fn include_same_parses_on_diff_and_defaults_off() {
+        let off = Cli::try_parse_from(["filesync", "diff", "--from", "/a", "--to", "/b"]).unwrap();
+        let on = Cli::try_parse_from(
+            ["filesync", "diff", "--from", "/a", "--to", "/b", "--include-same"],
+        )
+        .unwrap();
+        match (off.command, on.command) {
+            (Command::Diff(a), Command::Diff(b)) => assert!(!a.include_same && b.include_same),
+            _ => panic!("expected diff"),
+        }
+        // it's a read-side preview knob — the write command has no per-file findings to expand
+        assert!(Cli::try_parse_from(
+            ["filesync", "sync", "--from", "/a", "--to", "/b", "--include-same"]
+        )
+        .is_err());
     }
 
     #[test]

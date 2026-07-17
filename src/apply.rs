@@ -10,6 +10,7 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::hash;
 use crate::links;
@@ -43,6 +44,10 @@ pub struct Options {
 /// to `report.skipped` instead, which never affects the exit code. The one deliberate exception
 /// to keep-going: once the destination reports **out of space**, the remaining copies are skipped
 /// (each would only churn and fail) and a single summary issue says so.
+///
+/// A set `stop` flag (raised by a signal — see [`crate::interrupt`]) ends the loop **between**
+/// actions, so the in-flight file always completes; the finalize (directory metadata, the
+/// durability barrier, verify) still runs over the work done, and the report is marked incomplete.
 pub fn apply(
     src: &SrcRoot,
     dst: &DstRoot,
@@ -51,6 +56,7 @@ pub fn apply(
     opts: &Options,
     report: &mut Report,
     progress: &Progress,
+    stop: &AtomicBool,
 ) {
     // copied files: rel path + byte count + source content hash, for the verify stage
     let mut copied: Vec<(PathBuf, u64, blake3::Hash)> = Vec::new();
@@ -58,7 +64,13 @@ pub fn apply(
     let mut disk_full = false;
     let mut skipped_full = 0usize;
 
+    let mut performed = 0usize;
     for action in actions {
+        // Graceful stop: checked BETWEEN actions, so the in-flight file always finishes — we just
+        // don't start the next one. The finalize steps below still run over the work done.
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         match action {
             Action::CreateDir(rel) => {
                 if let Err(e) = fs::create_dir_all(dst.path().join(rel)) {
@@ -133,6 +145,7 @@ pub fn apply(
             },
         }
         progress.action_done();
+        performed += 1;
     }
     if skipped_full > 0 {
         report.issue_msg(format!(
@@ -145,17 +158,23 @@ pub fn apply(
     // copying into a directory bumps its mtime. Cheap, and only touches what actually differs.
     mirror_dir_metadata(src, dst, src_m);
 
-    // Durability barrier: unless we fsync'd each file as we went, make the whole run durable now
-    // — data and metadata (renames/deletes) alike. See crate::durability.
-    if !opts.fsync_each && !actions.is_empty() {
+    // Durability barrier: unless we fsync'd each file as we went, make the work durable now — data
+    // and metadata (renames/deletes) alike. On a graceful stop, only the actions we performed are
+    // flushed. See crate::durability.
+    if !opts.fsync_each && performed > 0 {
         let mut flushed: Vec<PathBuf> = copied.iter().map(|(rel, _, _)| rel.clone()).collect();
         flushed.extend(refreshed);
-        crate::durability::flush_destination(dst, actions, &flushed);
+        crate::durability::flush_destination(dst, &actions[..performed], &flushed);
     }
 
     // Verify + correct: re-read each copied file and confirm it matches the source content.
     if opts.verify {
         verify_copied(dst, &copied, report, progress);
+    }
+
+    // If a graceful stop cut the loop short, record it — the mirror is incomplete (exit non-zero).
+    if performed < actions.len() {
+        report.mark_stopped_early(performed, actions.len());
     }
 }
 
