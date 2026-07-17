@@ -171,9 +171,14 @@ Two assumptions about the source are load-bearing, so they are stated (and enfor
 1. **The source must be fully readable.** Mirroring decides deletions by *absence*: a file the scan
    couldn't see looks identical to a file the user deleted — and its destination twin might be the
    last surviving copy. The scan itself is the reachability check (it visits every directory), so
-   no separate pre-pass is needed. **If the source scan reports any read error (or skips a marked
-   backup dir), every deletion is suspended for that run** — copies and renames still proceed
-   (they are additive/content-preserving), and the report says what was suspended and why.
+   no separate pre-pass is needed. Two kinds of source read failure trigger the safety valve:
+   an unreadable **directory** (its contents vanish from the scan), and a listable-but-unreadable
+   **file** caught during classification — because a would-be move whose source can't be hashed
+   degrades to copy+delete, so a to-be-deleted destination file might actually be that file's
+   content under a new name. **On either — or a skipped marked backup dir — every deletion is
+   suspended for that run** — copies and renames still proceed (they are additive/content-
+   preserving), and the report says what was suspended and why. (Every read-failure message names
+   its side, so "my source won't back up" is never confused with "a destination extra".)
    Because deletions normally free space *before* the copies run, a suspended run also does a
    **space look-ahead**: if the destination can't fit all planned copies, the copies are skipped
    too rather than churning into a full disk.

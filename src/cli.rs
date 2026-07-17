@@ -45,7 +45,10 @@ pub struct Common {
     #[arg(long)]
     pub eager_checksum: bool,
 
-    /// Report file path. Default: ./filesync-report-<source>-<YYYY-mm-DD_HHMM>.txt
+    /// Where to write this run's report. Default:
+    /// ./filesync-<command>-<source>-<YYYY-mm-DD_HHMM>.txt in the current directory. Any issues go
+    /// to a sibling <name>.errors.txt (created only if there are any). Live progress stays on the
+    /// terminal, never in these files. The path must be outside both the source and destination.
     #[arg(long, value_name = "PATH")]
     pub report: Option<PathBuf>,
 

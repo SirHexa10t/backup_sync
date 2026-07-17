@@ -56,8 +56,31 @@ pub struct Diff {
     pub to_link: Vec<Link>,
     pub unchanged: usize,
     /// Files that couldn't be examined as intended (hash errors) — the classification degraded
-    /// safely instead of aborting the run. Callers should surface these.
+    /// safely instead of aborting the run. Each message names its side. Callers should surface them.
     pub issues: Vec<String>,
+    /// True if a **source** file couldn't be read while classifying (a move-candidate or an
+    /// eager comparison). This means the source view is incomplete in a way that can endanger
+    /// deletions — a would-be move degrades to copy+delete, so a to-be-deleted destination file
+    /// might actually be the unreadable source file's content under a new name. Callers treat this
+    /// like an unreadable source directory: suspend deletions. (Destination-side read failures
+    /// don't set it — they can't cause a wrong deletion.)
+    pub source_unreadable: bool,
+}
+
+/// Which tree a read failure occurred on — for message labeling and the source-unreadable signal.
+#[derive(Clone, Copy)]
+enum Side {
+    Source,
+    Destination,
+}
+
+impl Side {
+    fn label(self) -> &'static str {
+        match self {
+            Side::Source => "source",
+            Side::Destination => "destination",
+        }
+    }
 }
 
 /// Classify `src` vs `dst`. `eager` compares files by content hash instead of size+mtime.
@@ -113,7 +136,16 @@ pub fn diff(
                     d.removed.push(Change { rel: de.rel.clone(), kind: de.kind });
                 }
             }
-            Some(de) => match compare_entries(src, se, dst, de, eager, relative_symlinks, &mut d.issues) {
+            Some(de) => match compare_entries(
+                src,
+                se,
+                dst,
+                de,
+                eager,
+                relative_symlinks,
+                &mut d.issues,
+                &mut d.source_unreadable,
+            ) {
                 Verdict::Unchanged => d.unchanged += 1,
                 Verdict::Touched => d.touched.push(Change { rel: se.rel.clone(), kind: se.kind }),
                 Verdict::Changed => d.changed.push(Change { rel: se.rel.clone(), kind: se.kind }),
@@ -186,6 +218,7 @@ enum Verdict {
 ///   [`Verdict::Touched`] (metadata refresh, no write, nothing destroyed).
 /// - **Degrade, don't abort.** When content can't be compared (hash error), the verdict is
 ///   Changed — copying is the safe direction — and the failure is recorded in `issues`.
+#[allow(clippy::too_many_arguments)]
 fn compare_entries(
     src: &SrcRoot,
     se: &Entry,
@@ -194,6 +227,7 @@ fn compare_entries(
     eager: bool,
     relative_symlinks: bool,
     issues: &mut Vec<String>,
+    source_unreadable: &mut bool,
 ) -> Verdict {
     if se.kind != de.kind {
         return Verdict::Changed;
@@ -248,9 +282,19 @@ fn compare_entries(
                     }
                     Verdict::Changed
                 }
-                (Err(e), _) | (_, Err(e)) => {
+                // Source read failure is the consequential one — it marks the view incomplete
+                // (see Diff::source_unreadable). Check it first so it wins if both sides fail.
+                (Err(e), _) => {
+                    *source_unreadable = true;
                     issues.push(format!(
-                        "{}: cannot compare content ({e}); treating as changed",
+                        "source: {}: cannot read to compare content ({e}); treating as changed",
+                        se.rel.display()
+                    ));
+                    Verdict::Changed
+                }
+                (_, Err(e)) => {
+                    issues.push(format!(
+                        "destination: {}: cannot read to compare content ({e}); treating as changed",
                         se.rel.display()
                     ));
                     Verdict::Changed
@@ -292,8 +336,10 @@ fn detect_moves(
     let rem_cand: Vec<usize> =
         (0..rm_files.len()).filter(|&i| contested.contains(&rm_files[i].size)).collect();
 
-    let add_hashes = hash_candidates(src.path(), add_cand, add_files, &mut d.issues);
-    let rem_hashes = hash_candidates(dst.path(), rem_cand, rm_files, &mut d.issues);
+    let add_hashes =
+        hash_candidates(src.path(), Side::Source, add_cand, add_files, &mut d.issues, &mut d.source_unreadable);
+    let rem_hashes =
+        hash_candidates(dst.path(), Side::Destination, rem_cand, rm_files, &mut d.issues, &mut d.source_unreadable);
 
     // content hash → queue of remove indices with that content (queue handles duplicate content)
     let mut by_hash: HashMap<[u8; 32], VecDeque<usize>> = HashMap::new();
@@ -325,22 +371,33 @@ fn detect_moves(
     }
 }
 
-/// Hash the candidate files (by index into `files`) under `root`. Failures don't propagate: the
-/// candidate is dropped from move-matching (→ plain copy/delete) and the error recorded.
+/// Hash the candidate files (by index into `files`) under `root` on `side`. Failures don't
+/// propagate: the candidate is dropped from move-matching (→ plain copy/delete), the error is
+/// recorded (labeled with its side), and a source-side failure sets `source_unreadable` — a
+/// would-be move degrading to copy+delete could otherwise delete a destination file that is
+/// actually this unreadable source file's content under a new name.
 fn hash_candidates(
     root: &Path,
+    side: Side,
     cand: Vec<usize>,
     files: &[&Entry],
     issues: &mut Vec<String>,
+    source_unreadable: &mut bool,
 ) -> Vec<(usize, [u8; 32])> {
     let mut out = Vec::with_capacity(cand.len());
     for i in cand {
         match hash::hash_file(&root.join(&files[i].rel)) {
             Ok(h) => out.push((i, *h.as_bytes())),
-            Err(e) => issues.push(format!(
-                "{}: cannot hash for move-detection ({e}); treating as a plain copy/delete",
-                files[i].rel.display()
-            )),
+            Err(e) => {
+                if matches!(side, Side::Source) {
+                    *source_unreadable = true;
+                }
+                issues.push(format!(
+                    "{}: {}: cannot hash for move-detection ({e}); treating as a plain copy/delete",
+                    side.label(),
+                    files[i].rel.display()
+                ));
+            }
         }
     }
     out
@@ -357,37 +414,51 @@ impl Diff {
         self.changed.iter().map(|c| c.rel.clone()).collect()
     }
 
-    /// A git-diff-like textual summary (used by the `diff` command and, later, the report).
-    pub fn render(&self) -> String {
+    /// A git-diff-like textual summary. `detail` controls whether the per-file lines are included:
+    /// the findings file gets the full listing (`true`); the terminal gets only the count lines
+    /// (`false`), so a diff of a huge tree never floods the screen — the detail is in the file.
+    pub fn render(&self, detail: bool) -> String {
         use std::fmt::Write;
         let mut s = String::new();
         let _ = writeln!(s, "moved:     {}", self.moved.len());
-        for m in &self.moved {
-            let _ = writeln!(s, "    ~ {}  ->  {}", m.from.display(), m.to.display());
+        if detail {
+            for m in &self.moved {
+                let _ = writeln!(s, "    ~ {}  ->  {}", m.from.display(), m.to.display());
+            }
         }
         let _ = writeln!(s, "to copy:   {}", self.added.len());
-        for c in &self.added {
-            if c.kind == Kind::Other {
-                let _ = writeln!(s, "    + {} (special file — no content; will be skipped)", c.rel.display());
-            } else {
-                let _ = writeln!(s, "    + {}", c.rel.display());
+        if detail {
+            for c in &self.added {
+                if c.kind == Kind::Other {
+                    let _ = writeln!(s, "    + {} (special file — no content; will be skipped)", c.rel.display());
+                } else {
+                    let _ = writeln!(s, "    + {}", c.rel.display());
+                }
             }
         }
         let _ = writeln!(s, "to delete: {}", self.removed.len());
-        for c in &self.removed {
-            let _ = writeln!(s, "    - {}", c.rel.display());
+        if detail {
+            for c in &self.removed {
+                let _ = writeln!(s, "    - {}", c.rel.display());
+            }
         }
         let _ = writeln!(s, "to update: {}", self.changed.len());
-        for c in &self.changed {
-            let _ = writeln!(s, "    * {}", c.rel.display());
+        if detail {
+            for c in &self.changed {
+                let _ = writeln!(s, "    * {}", c.rel.display());
+            }
         }
         let _ = writeln!(s, "to link:   {} (hard links — content written once via the leader)", self.to_link.len());
-        for l in &self.to_link {
-            let _ = writeln!(s, "    & {}  ->  {}", l.name.display(), l.leader.display());
+        if detail {
+            for l in &self.to_link {
+                let _ = writeln!(s, "    & {}  ->  {}", l.name.display(), l.leader.display());
+            }
         }
         let _ = writeln!(s, "to refresh (content identical, metadata drift): {}", self.touched.len());
-        for c in &self.touched {
-            let _ = writeln!(s, "    ≈ {}", c.rel.display());
+        if detail {
+            for c in &self.touched {
+                let _ = writeln!(s, "    ≈ {}", c.rel.display());
+            }
         }
         let _ = writeln!(s, "unchanged: {}", self.unchanged);
         s

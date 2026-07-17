@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::manifest::{DstRoot, Entry, Kind, Manifest};
+use crate::progress::ScanProgress;
 
 /// Everything a scan learned: the manifest, plus what it could NOT include — read errors and
 /// backup dirs it deliberately skipped (directories carrying [`crate::apply::BACKUP_MARKER`]).
@@ -19,9 +20,9 @@ pub struct ScanOutcome {
 }
 
 /// Scan `root` into a manifest sorted by relative path. Read errors and backup-dir skips are
-/// discarded — use [`scan_with_errors`] when they need to be reported.
+/// discarded and no progress is shown — use [`scan_with_errors`] when either matters.
 pub fn scan(root: &Path) -> Manifest {
-    scan_with_errors(root).manifest
+    scan_with_errors(root, &mut ScanProgress::hidden()).manifest
 }
 
 /// Like [`scan`], but also reports what was left out: read errors (so a run can surface them
@@ -29,20 +30,20 @@ pub fn scan(root: &Path) -> Manifest {
 /// [`crate::apply::BACKUP_MARKER`] file — filesync's own move-aside storage, which must never be
 /// mirrored, deleted, or re-backed-up). Readable, unmarked entries are collected either way.
 /// Never modifies the tree — safe for the (read-only) source.
-pub fn scan_with_errors(root: &Path) -> ScanOutcome {
-    walk(root, false).0
+pub fn scan_with_errors(root: &Path, progress: &mut ScanProgress) -> ScanOutcome {
+    walk(root, false, progress).0
 }
 
 /// Scan the **destination**, additionally sweeping (deleting) any leftover atomic-copy temp files
 /// a previous interrupted run left behind — one walk instead of a separate sweep pass. Returns the
 /// outcome plus how many temp files were removed. Mutating, hence [`DstRoot`]-only (the type wall).
-pub fn scan_destination(dst: &DstRoot) -> (ScanOutcome, usize) {
-    walk(dst.path(), true)
+pub fn scan_destination(dst: &DstRoot, progress: &mut ScanProgress) -> (ScanOutcome, usize) {
+    walk(dst.path(), true, progress)
 }
 
 /// The shared walk. `sweep_tmp` deletes our `TMP_PREFIX` scratch files instead of just skipping
 /// them (destination only — the source is never modified).
-fn walk(root: &Path, sweep_tmp: bool) -> (ScanOutcome, usize) {
+fn walk(root: &Path, sweep_tmp: bool, progress: &mut ScanProgress) -> (ScanOutcome, usize) {
     let mut entries: Vec<Entry> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let mut skipped_backup_dirs: Vec<PathBuf> = Vec::new();
@@ -72,11 +73,18 @@ fn walk(root: &Path, sweep_tmp: bool) -> (ScanOutcome, usize) {
                 {
                     swept += 1;
                 }
+                progress.tick(0);
             }
             // the root-level lockfile is the running sync's own artifact, never content
-            Ok(dent) if dent.depth() == 1 && dent.file_name() == crate::lock::LOCK_FILE => {}
-            Ok(dent) => entries.push(entry_from(root, &dent)),
-            Err(e) => errors.push(describe_walk_error(&e)),
+            Ok(dent) if dent.depth() == 1 && dent.file_name() == crate::lock::LOCK_FILE => {
+                progress.tick(0);
+            }
+            Ok(dent) => {
+                let e = entry_from(root, &dent);
+                progress.tick(if e.kind == Kind::File { e.size } else { 0 });
+                entries.push(e);
+            }
+            Err(e) => errors.push(describe_walk_error(root, &e)),
         }
     }
 
@@ -84,11 +92,14 @@ fn walk(root: &Path, sweep_tmp: bool) -> (ScanOutcome, usize) {
     (ScanOutcome { manifest: Manifest::from_sorted(entries), errors, skipped_backup_dirs }, swept)
 }
 
-/// Render a walk error as `cannot read <path>: <reason>` (falling back to the raw error).
-fn describe_walk_error(e: &walkdir::Error) -> String {
-    match (e.path(), e.io_error()) {
-        (Some(p), Some(io)) => format!("cannot read {}: {io}", p.display()),
-        (Some(p), None) => format!("cannot read {}: {e}", p.display()),
+/// Render a walk error as `cannot read <rel-path>: <reason>` (falling back to the raw error). The
+/// path is made relative to `root` so scan errors read consistently with the diff's per-file
+/// issues; the caller prefixes the side (source/destination).
+fn describe_walk_error(root: &Path, e: &walkdir::Error) -> String {
+    let rel = e.path().map(|p| p.strip_prefix(root).unwrap_or(p).display().to_string());
+    match (rel, e.io_error()) {
+        (Some(rel), Some(io)) => format!("cannot read {rel}: {io}"),
+        (Some(rel), None) => format!("cannot read {rel}: {e}"),
         _ => format!("scan error: {e}"),
     }
 }

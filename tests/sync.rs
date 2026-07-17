@@ -207,7 +207,7 @@ fn no_temp_files_remain_after_sync() {
     common::build_corpus(s.path());
     sync_with(s.path(), d.path(), &default_opts());
     // a destination scan afterwards sweeps nothing ⇒ atomic copies left no temp files
-    let (_, swept) = filesync::scan::scan_destination(&DstRoot::new(d.path()));
+    let (_, swept) = filesync::scan::scan_destination(&DstRoot::new(d.path()), &mut filesync::progress::ScanProgress::hidden());
     assert_eq!(swept, 0);
 }
 
@@ -217,7 +217,7 @@ fn destination_scan_sweeps_leftover_temp_files_only() {
     common::file(d.path(), "keep.txt", b"k");
     common::file(d.path(), ".filesync_staging.tmp.999.old", b"junk");
     common::file(d.path(), "sub/.filesync_staging.tmp.999.old2", b"junk");
-    let (outcome, swept) = filesync::scan::scan_destination(&DstRoot::new(d.path()));
+    let (outcome, swept) = filesync::scan::scan_destination(&DstRoot::new(d.path()), &mut filesync::progress::ScanProgress::hidden());
     assert_eq!(swept, 2);
     assert!(d.path().join("keep.txt").is_file());
     assert!(!d.path().join(".filesync_staging.tmp.999.old").exists());

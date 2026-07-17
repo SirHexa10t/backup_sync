@@ -37,6 +37,7 @@ fn phases_are_ordered_rename_delete_createdir_copy() {
         to_link: vec![],
         unchanged: 3,
         issues: vec![],
+        source_unreadable: false,
     };
     let a = plan(&d);
 

@@ -81,8 +81,10 @@ symlinks, **hard-link groups mirrored as hard links** (the content is written on
 names are linked at the destination — and re-linked whenever the content is re-copied, so no name
 ever serves stale bytes; where the destination can't hold links, they fall back to independent
 copies with a note), file **and directory** permissions/mtimes mirrored where the destination
-filesystem supports them, a live progress bar on the terminal, one-sync-per-destination locking,
-and no confirmation prompts. A same-size file whose mtime drifted is **hash-checked before being
+filesystem supports them, live progress on the terminal (scan counters with entries + bytes
+covered, then a copy/verify bar), one-sync-per-destination locking, and no confirmation prompts.
+When output is redirected (cron logs), the live displays are replaced by occasional plain
+heartbeat lines and per-scan summaries — an overnight run stays visibly alive in its log. A same-size file whose mtime drifted is **hash-checked before being
 overwritten** — identical content just gets its metadata realigned (`refreshed` in the report), so
 nothing is destroyed, and nothing is re-copied, on a shallow signal. If you *don't* want deletion,
 a normal copy tool is the right choice — mirror fidelity is the point of filesync. If the
@@ -100,20 +102,34 @@ target path recorded**, letting you reconstruct them later elsewhere.
 
 ## The report
 
-Every run always writes a report to the current directory:
+Every run writes its output to files in the current directory, so a huge listing never scrolls off
+the screen and live progress never bleeds into a redirected file. filesync routes its three kinds of
+output by *meaning* — which shell redirection can't, since errors and progress would otherwise share
+stderr — into two files plus the terminal:
 
 ```
-./filesync-report-<source-folder-name>-<YYYY-mm-DD_HHMM>.txt
+./filesync-<command>-<source-folder-name>-<YYYY-mm-DD_HHMM>.txt          # the report / findings
+./filesync-<command>-<source-folder-name>-<YYYY-mm-DD_HHMM>.errors.txt   # issues — only if any
 ```
 
-(for example `filesync-report-Documents-2026-07-04_1530.txt`), and prints a summary to the screen.
-`--report <PATH>` overrides the location. The report must lie **outside both trees**, and filesync
-refuses to start otherwise: inside the source it would write into a read-only tree, and inside the
-destination the next run would mirror-delete it. (This includes the default location — running from
-a directory inside the source/destination is caught too.) An existing report is never overwritten —
-a colliding name gets a `-2`/`-3` suffix. The report is written as the run progresses, so even an
-interrupted run leaves a usable record; a completed one ends with a `run completed` line, so a
-report cut short by an interruption is recognizable.
+(for example `filesync-sync-Documents-2026-07-04_1530.txt`). `<command>` is `sync` or `diff`:
+
+- The **report** holds the findings. `sync` records what it did (the counts, plus any benign skips);
+  `diff` writes the full new/changed/moved/deleted listing — however large — and prints only a
+  compact count summary to the screen.
+- The **`.errors.txt`** companion holds anything needing your attention, one issue per line, each
+  labeled with its side (`source:` / `destination:`). It's created **only if there's at least one
+  issue** — so *no errors file means a clean run*.
+- **Live progress** (`… scanned …`) stays on the terminal only; it is never written to either file.
+
+`--report <PATH>` overrides the location (the `.errors.txt` companion follows its name). The path
+must lie **outside both trees**, and filesync refuses to start otherwise: inside the source it would
+write into a read-only tree, and inside the destination the next run would mirror-delete it. (This
+includes the default location — running from a directory inside the source or destination is caught
+too; run from elsewhere, or pass `--report`.) An existing report is never overwritten — a colliding
+name gets a `-2`/`-3` suffix. `sync` writes its report as the run progresses, so even an interrupted
+run leaves a usable record; a completed one ends with a `run completed` line, so a report cut short
+by an interruption is recognizable.
 
 ## Safety guarantees
 
@@ -123,8 +139,8 @@ report cut short by an interruption is recognizable.
 - **Deletions require a fully-readable source** — if any part of the source can't be read, a file
   hidden behind the error would look "deleted" and its destination twin (possibly the last copy)
   would be mirror-deleted. Instead, **all deletions are suspended for that run** (copies and renames
-  still proceed), and the report says so. An entirely empty source is likewise refused — it usually
-  means a drive didn't mount.
+  still proceed), and the errors file says so. An entirely empty source is likewise refused — it
+  usually means a drive didn't mount.
 - **Atomic writes** — each file is written to a temp file and atomically renamed into place, so an
   interruption can never leave a half-written file masquerading as a real one.
 - **Resumable** — a re-run re-compares and only redoes what didn't complete; no persistent state to

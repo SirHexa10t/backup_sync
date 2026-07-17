@@ -77,7 +77,7 @@ fn run_rejects_empty_source() {
 
 #[cfg(unix)]
 #[test]
-fn run_writes_unreadable_directory_into_the_report() {
+fn run_writes_unreadable_directory_into_the_errors_file() {
     let src = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();
     if !common::permissions_enforced(src.path()) {
@@ -94,8 +94,10 @@ fn run_writes_unreadable_directory_into_the_report() {
     let _ = run(sync_cli(src.path(), dst.path(), Some(report_path.clone())));
     common::restore_perms(src.path(), "vault");
 
-    let report = fs::read_to_string(&report_path).unwrap();
-    assert!(report.contains("vault"), "report should name the unreadable dir:\n{report}");
+    // An unreadable directory is an issue → it lands in the companion errors file, labeled by side.
+    let errors = fs::read_to_string(filesync::report::errors_sibling(&report_path)).unwrap();
+    assert!(errors.contains("vault"), "errors file should name the unreadable dir:\n{errors}");
+    assert!(errors.contains("source:"), "…and label its side:\n{errors}");
     assert!(dst.path().join("visible.txt").is_file(), "readable content still synced");
 }
 
@@ -188,11 +190,15 @@ fn run_resumes_after_interrupted_copy_and_reports_counts() {
     assert_eq!(fs::read(dst.path().join("a.txt")).unwrap(), b"aaa");
     assert_eq!(fs::read(dst.path().join("sub/b.txt")).unwrap(), b"bbb");
 
-    // and the report carries the final counts with no issues
+    // the report carries the final counts with no issues …
     let rep = fs::read_to_string(&report_path).unwrap();
     assert!(rep.contains("copied:  2"), "report should count both copies:\n{rep}");
     assert!(rep.contains("issues:  0"), "no issues expected:\n{rep}");
-    assert!(!rep.contains("\n  ! "), "no issue lines expected:\n{rep}");
+    // … and a clean run leaves NO errors file at all
+    assert!(
+        !filesync::report::errors_sibling(&report_path).exists(),
+        "a clean run must not create an errors file"
+    );
 }
 
 /// THE data-safety valve (audit finding #1): when any part of the source can't be read, its files
@@ -233,10 +239,54 @@ fn unreadable_source_subtree_suspends_all_deletes() {
     );
     // additive work still happened
     assert_eq!(fs::read(dst.path().join("ok.txt")).unwrap(), b"new content");
-    // and the report says so
+    // the report counts zero deletions …
     let rep = fs::read_to_string(&report_path).unwrap();
     assert!(rep.contains("deleted: 0"), "no deletions may be counted:\n{rep}");
-    assert!(rep.contains("suspended"), "report must state deletions were suspended:\n{rep}");
+    // … and the errors file states the suspension
+    let errors = fs::read_to_string(filesync::report::errors_sibling(&report_path)).unwrap();
+    assert!(
+        errors.contains("suspended"),
+        "errors file must state deletions were suspended:\n{errors}"
+    );
+}
+
+/// Fix B: a source *file* that's listable but unreadable (parent dir readable, so the scan sees it
+/// with no walkdir error) must still suspend deletions. The dangerous case: it's a move-candidate
+/// (source-only, e.g. a rename), so its would-be partner among the destination extras would be
+/// deleted instead of matched — potentially the last copy of that content. Nothing may be deleted.
+#[cfg(unix)]
+#[test]
+fn unreadable_source_file_suspends_deletes() {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    if !common::permissions_enforced(src.path()) {
+        eprintln!("skipping: permission bits not enforced (running as root?)");
+        return;
+    }
+    common::file(src.path(), "readable.txt", b"so the source isn't empty");
+    // a source-only, unreadable file (a rename's new name), same size as a destination extra
+    common::file(src.path(), "renamed.bin", b"PRECIOUS-PAYLOAD");
+    common::set_no_perms(src.path(), "renamed.bin");
+    // the destination holds the old name (the move partner) AND an unrelated extra
+    common::file(dst.path(), "original.bin", b"PRECIOUS-PAYLOAD");
+    common::file(dst.path(), "unrelated_extra.txt", b"also must survive");
+
+    let report_dir = tempfile::tempdir().unwrap();
+    let report_path = report_dir.path().join("r.txt");
+    let _ = run(sync_cli(src.path(), dst.path(), Some(report_path.clone())));
+    common::restore_perms(src.path(), "renamed.bin");
+
+    // no walkdir error occurred (the file was listable), yet ALL deletes are suspended:
+    assert!(
+        dst.path().join("original.bin").is_file(),
+        "the move partner must NOT be deleted — it may be the only readable copy of that content"
+    );
+    assert!(dst.path().join("unrelated_extra.txt").is_file(), "every deletion is suspended");
+    let rep = fs::read_to_string(&report_path).unwrap();
+    assert!(rep.contains("deleted: 0"), "no deletions counted:\n{rep}");
+    let errors = fs::read_to_string(filesync::report::errors_sibling(&report_path)).unwrap();
+    assert!(errors.contains("suspended"), "errors file states deletions were suspended:\n{errors}");
+    assert!(errors.contains("source:"), "the unreadable source file is reported, labeled:\n{errors}");
 }
 
 /// Audit finding #2b: the backup dir receives writes, so it must never be inside the read-only
@@ -307,6 +357,64 @@ fn backup_dir_reuse_is_rejected() {
         fs::read(backup.join("extra.txt")).unwrap(),
         b"first run's version",
         "the previous run's backups stay untouched"
+    );
+}
+
+/// Run the real binary so stderr is a pipe (non-terminal): progress must stream to stderr, the
+/// compact summary and suspension preview to stdout, and the full listing + issues to the two
+/// output files — none of these mixing with the others.
+#[cfg(unix)]
+#[test]
+fn diff_subprocess_streams_progress_and_writes_findings_and_errors_files() {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    if !common::permissions_enforced(src.path()) {
+        eprintln!("skipping: permission bits not enforced (running as root?)");
+        return;
+    }
+    common::file(src.path(), "ok.txt", b"fine");
+    common::file(src.path(), "vault/hidden.txt", b"x");
+    common::file(dst.path(), "stale_extra.txt", b"would be deleted");
+    common::set_no_perms(src.path(), "vault"); // source view becomes incomplete
+
+    // --report keeps both output files out of the repo (and exercises the diff report path).
+    let report_dir = tempfile::tempdir().unwrap();
+    let report_path = report_dir.path().join("d.txt");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_filesync"))
+        .args(["diff", "--from"])
+        .arg(src.path())
+        .arg("--to")
+        .arg(dst.path())
+        .arg("--report")
+        .arg(&report_path)
+        .output()
+        .expect("run the filesync binary");
+    common::restore_perms(src.path(), "vault");
+
+    let err = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // progress streams to stderr (non-tty log mode) …
+    assert!(
+        err.contains("scanned") && err.contains("entries"),
+        "non-tty stderr should carry log-mode scan summaries:\n{err}"
+    );
+    // … while the count summary and the suspension preview go to stdout (never the full listing)
+    assert!(stdout.contains("to delete: 1"), "the count summary is on stdout:\n{stdout}");
+    assert!(
+        stdout.contains("SUSPEND"),
+        "diff must say a sync would suspend the listed deletions:\n{stdout}"
+    );
+    assert!(out.status.success(), "diff is a preview — it exits 0");
+
+    // the full per-file listing is in the findings file …
+    let findings = fs::read_to_string(&report_path).unwrap();
+    assert!(findings.contains("- stale_extra.txt"), "findings file lists the deletion:\n{findings}");
+    // … and the unreadable source dir is recorded, labeled, in the errors file
+    let errors = fs::read_to_string(filesync::report::errors_sibling(&report_path)).unwrap();
+    assert!(
+        errors.contains("source:") && errors.contains("vault"),
+        "errors file records the labeled source read failure:\n{errors}"
     );
 }
 

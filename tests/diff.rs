@@ -251,11 +251,40 @@ fn unreadable_move_candidate_degrades_to_copy_plus_delete() {
     assert!(r.added_paths().contains(&PathBuf::from("locked.bin")), "falls back to a plain copy");
     assert!(r.removed_paths().contains(&PathBuf::from("extra.bin")), "…and a plain delete");
     assert!(r.added_paths().contains(&PathBuf::from("normal.txt")), "the run continues");
+    // Fix A: the issue names the SIDE (source), not just the path.
     assert!(
-        r.issues.iter().any(|i| i.contains("locked.bin")),
-        "the degradation is reported: {:?}",
+        r.issues.iter().any(|i| i.contains("locked.bin") && i.contains("source:")),
+        "the degradation is reported and labeled source: {:?}",
         r.issues
     );
+    // Fix B: an unreadable SOURCE file marks the view incomplete → the caller will suspend deletes.
+    assert!(r.source_unreadable, "an unreadable source move-candidate must flag the incomplete view");
+}
+
+/// A destination-side unreadable candidate is reported and labeled — but must NOT set
+/// `source_unreadable`: a destination read gap can't cause a wrong deletion, so deletes proceed.
+#[cfg(unix)]
+#[test]
+fn unreadable_destination_candidate_is_labeled_but_does_not_flag_the_source() {
+    let (s, d) = dirs();
+    if !common::permissions_enforced(d.path()) {
+        eprintln!("skipping: permission bits not enforced (running as root?)");
+        return;
+    }
+    common::file(s.path(), "add.bin", b"AAAA"); // readable source add
+    common::file(d.path(), "locked_extra.bin", b"BBBB"); // same size ⇒ candidate; unreadable
+    common::set_no_perms(d.path(), "locked_extra.bin");
+
+    let r = run_diff(s.path(), d.path(), false);
+    common::restore_perms(d.path(), "locked_extra.bin");
+
+    assert!(
+        r.issues.iter().any(|i| i.contains("locked_extra.bin") && i.contains("destination:")),
+        "labeled destination: {:?}",
+        r.issues
+    );
+    assert!(!r.source_unreadable, "a destination read failure must not suspend deletes");
+    assert!(r.removed_paths().contains(&PathBuf::from("locked_extra.bin")));
 }
 
 #[cfg(unix)]
