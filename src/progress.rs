@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 pub struct Progress {
     bar: Option<ProgressBar>,
@@ -112,13 +112,19 @@ impl ScanProgress {
     /// Start feedback for scanning `root`, picking the terminal or log style automatically.
     pub fn start(root: &Path) -> Self {
         let mode = if std::io::stderr().is_terminal() {
-            let bar = ProgressBar::new_spinner();
-            bar.set_style(
-                ProgressStyle::with_template("  {spinner} scan {prefix}  {msg}").unwrap(),
-            );
-            bar.set_prefix(root.display().to_string());
-            bar.enable_steady_tick(Duration::from_millis(200));
-            ScanMode::Terminal(bar)
+            ScanMode::Terminal(scan_spinner(root))
+        } else {
+            ScanMode::Log { root: root.display().to_string(), last_heartbeat: Instant::now() }
+        };
+        Self { mode, entries: 0, bytes: 0, started: Instant::now() }
+    }
+
+    /// Like [`start`](Self::start), but the terminal spinner is added to a shared [`MultiProgress`]
+    /// so two concurrent scans draw on their own lines instead of clobbering each other. Off a
+    /// terminal it's identical to `start` (independent heartbeat lines, each naming its root).
+    pub fn start_in(group: &MultiProgress, root: &Path) -> Self {
+        let mode = if std::io::stderr().is_terminal() {
+            ScanMode::Terminal(group.add(scan_spinner(root)))
         } else {
             ScanMode::Log { root: root.display().to_string(), last_heartbeat: Instant::now() }
         };
@@ -161,6 +167,119 @@ impl ScanProgress {
                 human_elapsed(self.started.elapsed())
             ),
             ScanMode::Hidden => {}
+        }
+    }
+}
+
+/// A scan spinner with the shared style, ready to tick.
+fn scan_spinner(root: &Path) -> ProgressBar {
+    let bar = ProgressBar::new_spinner();
+    bar.set_style(ProgressStyle::with_template("  {spinner} scan {prefix}  {msg}").unwrap());
+    bar.set_prefix(root.display().to_string());
+    bar.enable_steady_tick(Duration::from_millis(200));
+    bar
+}
+
+/// Keeps the [`MultiProgress`] alive for the duration of two paired (concurrent) scans — hold it
+/// until both finish (dropping it stops the coordinated drawing).
+pub struct ScanPair {
+    _group: MultiProgress,
+}
+
+/// Progress handles for two scans that will run concurrently (source and destination on different
+/// devices). Both terminal spinners share one [`MultiProgress`] so they occupy separate lines.
+/// Returns the guard (keep it alive) plus the two handles (move each into its scan thread).
+pub fn scan_pair(a: &Path, b: &Path) -> (ScanPair, ScanProgress, ScanProgress) {
+    let group = MultiProgress::new();
+    let pa = ScanProgress::start_in(&group, a);
+    let pb = ScanProgress::start_in(&group, b);
+    (ScanPair { _group: group }, pa, pb)
+}
+
+/// Live feedback for the classification phase — the content hashing done for move-detection (and,
+/// under `--eager` or on mtime drift, for same-path comparisons), which is otherwise silent. Like
+/// [`Progress`] it uses `&self` + atomics, so the two parallel move-detection hash passes can share
+/// one handle. On a terminal: a spinner counting files/bytes hashed. Off-terminal: quiet during the
+/// work, with one summary line at the end (skipped entirely when nothing was hashed).
+pub struct CompareProgress {
+    mode: CompareMode,
+    files: AtomicU64,
+    bytes: AtomicU64,
+    /// Move-detection candidate count; 0 until known — once set, the spinner shows `N/total`.
+    move_total: AtomicU64,
+    started: Instant,
+}
+
+enum CompareMode {
+    Terminal(ProgressBar),
+    Log,
+    Hidden,
+}
+
+impl CompareProgress {
+    /// A no-op handle (tests, and library paths that don't want output).
+    pub fn hidden() -> Self {
+        Self::with_mode(CompareMode::Hidden)
+    }
+
+    /// Start feedback for the compare phase, picking the terminal or log style automatically.
+    pub fn start() -> Self {
+        let mode = if std::io::stderr().is_terminal() {
+            let bar = ProgressBar::new_spinner();
+            bar.set_style(ProgressStyle::with_template("  {spinner} compare  {msg}").unwrap());
+            bar.enable_steady_tick(Duration::from_millis(200));
+            CompareMode::Terminal(bar)
+        } else {
+            CompareMode::Log
+        };
+        Self::with_mode(mode)
+    }
+
+    fn with_mode(mode: CompareMode) -> Self {
+        Self {
+            mode,
+            files: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            move_total: AtomicU64::new(0),
+            started: Instant::now(),
+        }
+    }
+
+    /// Announce how many move-detection candidates are about to be hashed, so the spinner can show
+    /// `N/total`. Call once, before that hashing.
+    pub fn set_move_total(&self, n: u64) {
+        self.move_total.store(n, Ordering::Relaxed);
+    }
+
+    /// Record one file hashed (`bytes` of content read). Cheap — two relaxed atomic adds; the
+    /// terminal message is refreshed only occasionally (the steady tick redraws it anyway).
+    pub fn hashed(&self, bytes: u64) {
+        let f = self.files.fetch_add(1, Ordering::Relaxed) + 1;
+        let b = self.bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        if let CompareMode::Terminal(bar) = &self.mode {
+            if f == 1 || f % 16 == 0 {
+                let total = self.move_total.load(Ordering::Relaxed);
+                bar.set_message(if total > 0 {
+                    format!("{f}/{total} files, {} hashed", human_bytes(b))
+                } else {
+                    format!("{f} files, {} hashed", human_bytes(b))
+                });
+            }
+        }
+    }
+
+    /// Done: clear the spinner (terminal), or leave one summary line (log) — but only if any
+    /// content was actually hashed (a plain diff with no moves and no `--eager` hashes nothing).
+    pub fn finish(&self) {
+        let files = self.files.load(Ordering::Relaxed);
+        match &self.mode {
+            CompareMode::Terminal(bar) => bar.finish_and_clear(),
+            CompareMode::Log if files > 0 => eprintln!(
+                "filesync: compared {files} file(s) ({}) in {}",
+                human_bytes(self.bytes.load(Ordering::Relaxed)),
+                human_elapsed(self.started.elapsed())
+            ),
+            _ => {}
         }
     }
 }

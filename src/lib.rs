@@ -55,25 +55,45 @@ pub fn run(cli: Cli) -> u8 {
                 }
             };
 
-            let mut sp = progress::ScanProgress::start(src.path());
-            let src_scan = scan::scan_with_errors(src.path(), &mut sp);
-            sp.finish();
-            let mut dp = progress::ScanProgress::start(dst.path());
-            let dst_scan = scan::scan_with_errors(dst.path(), &mut dp);
-            dp.finish();
+            // Scan both trees. On different devices, do it concurrently — the two reads use
+            // independent I/O paths and the CPU isn't the bottleneck; on one device, sequentially
+            // (parallel reads would only fight over the head).
+            let parallel = different_devices(src.path(), dst.path());
+            let (src_scan, dst_scan) = if parallel {
+                let (_group, mut sp, mut dp) = progress::scan_pair(src.path(), dst.path());
+                let dst_path = dst.path();
+                std::thread::scope(|s| {
+                    let dh = s.spawn(move || {
+                        let o = scan::scan_with_errors(dst_path, &mut dp);
+                        dp.finish();
+                        o
+                    });
+                    let so = scan::scan_with_errors(src.path(), &mut sp);
+                    sp.finish();
+                    (so, dh.join().expect("destination scan thread panicked"))
+                })
+            } else {
+                let mut sp = progress::ScanProgress::start(src.path());
+                let so = scan::scan_with_errors(src.path(), &mut sp);
+                sp.finish();
+                let mut dp = progress::ScanProgress::start(dst.path());
+                let d_out = scan::scan_with_errors(dst.path(), &mut dp);
+                dp.finish();
+                (so, d_out)
+            };
 
             let src_scan_incomplete =
                 !src_scan.errors.is_empty() || !src_scan.skipped_backup_dirs.is_empty();
             let (src_m, dst_m) = (src_scan.manifest, dst_scan.manifest);
-            let d = diff::diff(
-                &src,
-                &src_m,
-                &dst,
-                &dst_m,
-                a.common.eager_checksum,
-                a.common.relative_symlinks,
-                a.include_same,
-            );
+            let dopts = diff::DiffOptions {
+                eager: a.common.eager_checksum,
+                relative_symlinks: a.common.relative_symlinks,
+                include_same: a.include_same,
+                parallel,
+            };
+            let cp = progress::CompareProgress::start();
+            let d = diff::diff(&src, &src_m, &dst, &dst_m, &dopts, &cp);
+            cp.finish();
 
             // Everything that needs attention, each line naming its side — bound for the errors
             // file. The two trees fail very differently: a source read gap risks your data, a
@@ -203,9 +223,31 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> u8 {
         }
     }
 
-    let mut sp = progress::ScanProgress::start(src.path());
-    let src_scan = scan::scan_with_errors(src.path(), &mut sp);
-    sp.finish();
+    // Scan both trees — concurrently when they're on different devices (independent I/O paths),
+    // sequentially on one device. The destination scan also sweeps temp files a previous,
+    // interrupted run left behind.
+    let parallel = different_devices(src.path(), dst.path());
+    let (src_scan, (dst_scan, swept)) = if parallel {
+        let (_group, mut sp, mut dp) = progress::scan_pair(src.path(), dst.path());
+        std::thread::scope(|s| {
+            let dh = s.spawn(move || {
+                let r = scan::scan_destination(dst, &mut dp);
+                dp.finish();
+                r
+            });
+            let so = scan::scan_with_errors(src.path(), &mut sp);
+            sp.finish();
+            (so, dh.join().expect("destination scan thread panicked"))
+        })
+    } else {
+        let mut sp = progress::ScanProgress::start(src.path());
+        let so = scan::scan_with_errors(src.path(), &mut sp);
+        sp.finish();
+        let mut dp = progress::ScanProgress::start(dst.path());
+        let dr = scan::scan_destination(dst, &mut dp);
+        dp.finish();
+        (so, dr)
+    };
     if src_scan.manifest.is_empty() {
         eprintln!(
             "filesync sync: source {} is empty — refusing to mirror, which would delete everything \
@@ -215,10 +257,6 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> u8 {
         );
         return 1;
     }
-    // The destination scan also sweeps temp files a previous, interrupted run left behind.
-    let mut dp = progress::ScanProgress::start(dst.path());
-    let (dst_scan, swept) = scan::scan_destination(dst, &mut dp);
-    dp.finish();
     if swept > 0 {
         eprintln!("filesync: removed {swept} leftover temp file(s) from a previous run");
     }
@@ -228,8 +266,15 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> u8 {
     let (src_m, dst_m) = (src_scan.manifest, dst_scan.manifest);
 
     // include_same is a diff-only findings toggle; the sync planner never needs the unchanged list.
-    let d =
-        diff::diff(src, &src_m, dst, &dst_m, a.common.eager_checksum, a.common.relative_symlinks, false);
+    let dopts = diff::DiffOptions {
+        eager: a.common.eager_checksum,
+        relative_symlinks: a.common.relative_symlinks,
+        include_same: false,
+        parallel,
+    };
+    let cp = progress::CompareProgress::start();
+    let d = diff::diff(src, &src_m, dst, &dst_m, &dopts, &cp);
+    cp.finish();
 
     let opts = apply::Options {
         verify: !a.no_verify,
@@ -617,6 +662,20 @@ fn same_filesystem(a: &Path, b: &Path) -> std::io::Result<bool> {
     Ok(fs_device(a)? == fs_device(b)?)
 }
 
+/// Whether `a` and `b` sit on **different** devices — the cue that scanning or hashing them
+/// concurrently overlaps independent I/O instead of contending for one disk head. Unknown or
+/// off-unix → `false` (stay sequential; never risk thrashing a single spindle). Caveat: two
+/// partitions of one physical disk look "different" here — the real win is separate drives.
+#[cfg(unix)]
+fn different_devices(a: &Path, b: &Path) -> bool {
+    matches!((fs_device(a), fs_device(b)), (Ok(da), Ok(db)) if da != db)
+}
+
+#[cfg(not(unix))]
+fn different_devices(_a: &Path, _b: &Path) -> bool {
+    false
+}
+
 /// Device id of the filesystem holding `path`, or — if `path` doesn't exist yet — of its nearest
 /// existing ancestor (so a not-yet-created backup dir is judged by where it *would* be created).
 #[cfg(unix)]
@@ -648,6 +707,18 @@ fn same_filesystem(_a: &Path, _b: &Path) -> std::io::Result<bool> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn different_devices_is_false_within_one_filesystem() {
+        // Two directories on the same filesystem must NOT be judged different devices — so paired
+        // scans stay sequential rather than thrashing one disk head.
+        let t = tempfile::tempdir().unwrap();
+        let (a, b) = (t.path().join("a"), t.path().join("b"));
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        assert!(!different_devices(&a, &b));
+    }
 
     #[cfg(unix)]
     #[test]

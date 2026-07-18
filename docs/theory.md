@@ -306,6 +306,20 @@ Two firm conclusions:
    The barrier is 49,152 *serialized* device flushes — a large fixed cost that dominates a small-file
    backup and swamps everything else.
 
+### A different axis: scanning two devices at once
+
+The verdict above concerns parallel work on **one** device, where a single stream already saturates
+it. Reading the **source and destination concurrently** is the opposite situation: in the normal
+backup case they're on *different* devices (internal disk ↔ external drive), so the two scans — and,
+in the classification phase, the two move-detection hash passes (source candidates vs destination
+candidates) — travel independent I/O paths. Overlapping them roughly halves that phase's wall-clock
+for free (the CPU is never the bottleneck). filesync does this automatically, gated on a device-id
+check (`stat().dev()` on the two roots): different devices → concurrent (`std::thread::scope`, no new
+dependency); same device → sequential, since parallel reads there would only thrash one head. This
+doesn't contradict the `--jobs` verdict — it's a distinct axis (two devices, not N workers on one).
+(Caveat: two partitions of one physical disk look "different" to the dev-id check; the real win is
+genuinely separate drives.)
+
 ### The fix: one fs-sync, not N per-file fsyncs
 
 This resolves the discrepancy the plan already implied: the barrier looped `sync_all` per copied

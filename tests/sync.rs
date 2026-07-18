@@ -10,10 +10,10 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime};
 
 use filesync::apply::{apply, verify_matches, Options};
-use filesync::diff::diff;
+use filesync::diff::{diff, DiffOptions};
 use filesync::manifest::{DstRoot, Kind, SrcRoot};
 use filesync::plan::{plan, Action};
-use filesync::progress::Progress;
+use filesync::progress::{CompareProgress, Progress};
 use filesync::report::Report;
 use filesync::scan::scan;
 
@@ -30,7 +30,8 @@ fn default_opts() -> Options {
 fn sync_with(src: &Path, dst: &Path, opts: &Options) -> Report {
     let (s, d) = (SrcRoot::new(src), DstRoot::new(dst));
     let (sm, dm) = (scan(src), scan(dst));
-    let df = diff(&s, &sm, &d, &dm, false, opts.relative_symlinks, false);
+    let dopts = DiffOptions { relative_symlinks: opts.relative_symlinks, ..DiffOptions::default() };
+    let df = diff(&s, &sm, &d, &dm, &dopts, &CompareProgress::hidden());
     let actions = plan(&df);
     let mut r = Report::new();
     for issue in df.issues {
@@ -274,9 +275,8 @@ fn graceful_stop_halts_before_the_next_action_and_marks_the_report() {
         &sm,
         &DstRoot::new(d.path()),
         &scan(d.path()),
-        false,
-        false,
-        false,
+        &DiffOptions::default(),
+        &CompareProgress::hidden(),
     ));
     assert!(!actions.is_empty(), "there is real work to stop");
 

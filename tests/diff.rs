@@ -7,8 +7,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use filesync::diff::{diff, Diff, Move};
+use filesync::diff::{diff, Diff, DiffOptions, Move};
 use filesync::manifest::{DstRoot, SrcRoot};
+use filesync::progress::CompareProgress;
 use filesync::scan::scan;
 
 fn run_diff(src: &Path, dst: &Path, eager: bool) -> Diff {
@@ -18,13 +19,15 @@ fn run_diff(src: &Path, dst: &Path, eager: bool) -> Diff {
 fn run_diff_flag(src: &Path, dst: &Path, eager: bool, relative_symlinks: bool) -> Diff {
     let (s, d) = (SrcRoot::new(src), DstRoot::new(dst));
     let (sm, dm) = (scan(src), scan(dst));
-    diff(&s, &sm, &d, &dm, eager, relative_symlinks, false)
+    let opts = DiffOptions { eager, relative_symlinks, ..DiffOptions::default() };
+    diff(&s, &sm, &d, &dm, &opts, &CompareProgress::hidden())
 }
 
 fn run_diff_same(src: &Path, dst: &Path) -> Diff {
     let (s, d) = (SrcRoot::new(src), DstRoot::new(dst));
     let (sm, dm) = (scan(src), scan(dst));
-    diff(&s, &sm, &d, &dm, false, false, true)
+    let opts = DiffOptions { include_same: true, ..DiffOptions::default() };
+    diff(&s, &sm, &d, &dm, &opts, &CompareProgress::hidden())
 }
 
 fn dirs() -> (tempfile::TempDir, tempfile::TempDir) {
@@ -38,6 +41,23 @@ fn missing_file_is_added() {
     let r = run_diff(s.path(), d.path(), false);
     assert_eq!(r.added_paths(), vec![PathBuf::from("a.txt")]);
     assert!(r.removed.is_empty() && r.changed.is_empty() && r.moved.is_empty());
+}
+
+#[test]
+fn parallel_move_detection_matches_sequential() {
+    // Forcing `parallel` runs the two move-detection hash passes on separate threads (in-process,
+    // regardless of the actual device); the result must be identical to the sequential path.
+    let (s, d) = dirs();
+    common::file(s.path(), "name_new.bin", b"CONTENT-TO-MOVE"); // top-level: no dir add/removes
+    common::file(d.path(), "name_old.bin", b"CONTENT-TO-MOVE");
+    let (sr, dr) = (SrcRoot::new(s.path()), DstRoot::new(d.path()));
+    let (sm, dm) = (scan(s.path()), scan(d.path()));
+    let opts = DiffOptions { parallel: true, ..DiffOptions::default() };
+    let r = diff(&sr, &sm, &dr, &dm, &opts, &CompareProgress::hidden());
+    assert_eq!(r.moved.len(), 1, "the parallel hash passes still detect the move");
+    assert_eq!(r.moved[0].from, PathBuf::from("name_old.bin"));
+    assert_eq!(r.moved[0].to, PathBuf::from("name_new.bin"));
+    assert!(r.added.is_empty() && r.removed.is_empty(), "a move is neither an add nor a delete");
 }
 
 #[test]
@@ -133,18 +153,16 @@ fn duplicate_content_pairs_each_move_once() {
 }
 
 #[test]
-fn empty_files_pair_as_a_move() {
-    // Two zero-byte files hash identically, so an empty file that changed path is a rename —
-    // pinned: equivalent cost to create+delete, and it keeps the "moved" report truthful.
+fn empty_files_are_not_move_matched() {
+    // Every empty file hashes identically, so pairing empties as "moves" is arbitrary noise.
+    // Size 0 is excluded from move-detection: empty files stay plain add/delete (no pointless open).
     let (s, d) = dirs();
     common::file(s.path(), "empty_new", b"");
     common::file(d.path(), "empty_old", b"");
     let r = run_diff(s.path(), d.path(), false);
-    assert_eq!(
-        r.moved,
-        vec![Move { from: PathBuf::from("empty_old"), to: PathBuf::from("empty_new") }]
-    );
-    assert!(r.added.is_empty() && r.removed.is_empty());
+    assert!(r.moved.is_empty(), "empty files must not be paired as a move");
+    assert_eq!(r.added_paths(), vec![PathBuf::from("empty_new")], "the empty add stays an add");
+    assert_eq!(r.removed_paths(), vec![PathBuf::from("empty_old")], "the empty remove stays a delete");
 }
 
 #[test]

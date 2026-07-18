@@ -83,8 +83,11 @@ symlinks, **hard-link groups mirrored as hard links** (the content is written on
 names are linked at the destination — and re-linked whenever the content is re-copied, so no name
 ever serves stale bytes; where the destination can't hold links, they fall back to independent
 copies with a note), file **and directory** permissions/mtimes mirrored where the destination
-filesystem supports them, live progress on the terminal (scan counters with entries + bytes
-covered, then a copy/verify bar), one-sync-per-destination locking, and no confirmation prompts.
+filesystem supports them, **concurrent scanning of source and destination when they're on different
+devices** (they use independent I/O paths and the CPU isn't the bottleneck; same-device stays
+sequential), live progress on the terminal (per-device scan counters with entries + bytes, then a
+compare spinner while it hashes for move-detection, then a copy/verify bar), one-sync-per-destination
+locking, and no confirmation prompts.
 When output is redirected (cron logs), the live displays are replaced by occasional plain
 heartbeat lines and per-scan summaries — an overnight run stays visibly alive in its log. A same-size file whose mtime drifted is **hash-checked before being
 overwritten** — identical content just gets its metadata realigned (`refreshed` in the report), so

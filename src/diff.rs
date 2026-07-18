@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime};
 use crate::hash;
 use crate::links;
 use crate::manifest::{DstRoot, Entry, Kind, Manifest, SrcRoot};
+use crate::progress::CompareProgress;
 
 /// A single-path difference, carrying the entry kind so the planner knows how to realize it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,17 +88,32 @@ impl Side {
     }
 }
 
-/// Classify `src` vs `dst`. `eager` compares files by content hash instead of size+mtime.
-/// `relative_symlinks` compares each destination link against the target a copy WOULD write
-/// ([`links::desired_target`]) — so a link already rewritten by a previous run is "unchanged".
+/// Knobs for [`diff`]: comparison semantics, plus one execution hint.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DiffOptions {
+    /// Compare files by content hash instead of the fast size+mtime check.
+    pub eager: bool,
+    /// Compare each destination symlink against the target a copy WOULD write
+    /// ([`links::desired_target`]) — so a link a previous run already rewrote reads as "unchanged".
+    pub relative_symlinks: bool,
+    /// Collect the paths of content-identical entries (for `diff --include-same`); off by default,
+    /// since on a large tree that list dwarfs every other category.
+    pub include_same: bool,
+    /// Read the source and destination move-detection hashes concurrently — worth it only when the
+    /// two roots live on different devices (independent I/O paths). The caller decides; `diff` obeys.
+    pub parallel: bool,
+}
+
+/// Classify `src` vs `dst` (see [`DiffOptions`]). `progress` reports the content hashing this does
+/// for move-detection (and, under `eager`/mtime drift, for same-path comparisons) — otherwise a
+/// silent phase; pass [`CompareProgress::hidden`] when no output is wanted.
 pub fn diff(
     src: &SrcRoot,
     src_m: &Manifest,
     dst: &DstRoot,
     dst_m: &Manifest,
-    eager: bool,
-    relative_symlinks: bool,
-    include_same: bool,
+    opts: &DiffOptions,
+    progress: &CompareProgress,
 ) -> Diff {
     let dst_by_path: HashMap<&Path, &Entry> = dst_m.iter().map(|e| (e.rel.as_path(), e)).collect();
     let src_by_path: HashMap<&Path, &Entry> = src_m.iter().map(|e| (e.rel.as_path(), e)).collect();
@@ -146,14 +162,15 @@ pub fn diff(
                 se,
                 dst,
                 de,
-                eager,
-                relative_symlinks,
+                opts.eager,
+                opts.relative_symlinks,
                 &mut d.issues,
                 &mut d.source_unreadable,
+                progress,
             ) {
                 Verdict::Unchanged => {
                     d.unchanged += 1;
-                    if include_same {
+                    if opts.include_same {
                         d.unchanged_paths.push(se.rel.clone());
                     }
                 }
@@ -174,7 +191,7 @@ pub fn diff(
         }
     }
 
-    detect_moves(src, &add_files, dst, &rm_files, &mut d);
+    detect_moves(src, &add_files, dst, &rm_files, opts.parallel, progress, &mut d);
 
     // Linkage pass. THE trap this must never fall into: a re-copied leader lands via atomic
     // temp+rename, which creates a NEW destination inode — existing links at follower names keep
@@ -200,7 +217,7 @@ pub fn diff(
                 };
             if properly_linked {
                 d.unchanged += 1;
-                if include_same {
+                if opts.include_same {
                     d.unchanged_paths.push(f.rel.clone());
                 }
             } else {
@@ -242,6 +259,7 @@ fn compare_entries(
     relative_symlinks: bool,
     issues: &mut Vec<String>,
     source_unreadable: &mut bool,
+    progress: &CompareProgress,
 ) -> Verdict {
     if se.kind != de.kind {
         return Verdict::Changed;
@@ -270,11 +288,14 @@ fn compare_entries(
             if !eager && same_mtime {
                 return Verdict::Unchanged; // the fast path: size + mtime agree
             }
-            // Same size but mtime drifted (or eager mode): decide by content.
+            // Same size but mtime drifted (or eager mode): decide by content. Both reads are
+            // reported to the compare progress (this is otherwise-silent hashing work).
             let (sh, dh) = (
                 hash::hash_file(&src.path().join(&se.rel)),
                 hash::hash_file(&dst.path().join(&de.rel)),
             );
+            progress.hashed(se.size);
+            progress.hashed(de.size);
             match (sh, dh) {
                 (Ok(a), Ok(b)) if a == b => {
                     if same_mtime {
@@ -333,27 +354,54 @@ fn mtime_close(a: Option<SystemTime>, b: Option<SystemTime>) -> bool {
 /// Pair content-identical adds (source) with removes (dest) — those are moves. Size pre-filter +
 /// hashing of only the contested candidates + hash→queue matching (dup-content safe). A candidate
 /// that can't be hashed simply isn't a move (falls back to plain copy/delete, with an issue).
+/// **Empty (0-byte) files are excluded**: every empty file hashes identically, so pairing them as
+/// "moves" is arbitrary — they fall through to plain add/delete, and the conclusions note says so.
 fn detect_moves(
     src: &SrcRoot,
     add_files: &[&Entry],
     dst: &DstRoot,
     rm_files: &[&Entry],
+    parallel: bool,
+    progress: &CompareProgress,
     d: &mut Diff,
 ) {
     let add_sizes: HashSet<u64> = add_files.iter().map(|e| e.size).collect();
     let rem_sizes: HashSet<u64> = rm_files.iter().map(|e| e.size).collect();
     let contested: HashSet<u64> = add_sizes.intersection(&rem_sizes).copied().collect();
 
-    // Indices of files worth hashing: only those whose size appears on both sides.
-    let add_cand: Vec<usize> =
-        (0..add_files.len()).filter(|&i| contested.contains(&add_files[i].size)).collect();
-    let rem_cand: Vec<usize> =
-        (0..rm_files.len()).filter(|&i| contested.contains(&rm_files[i].size)).collect();
+    // Indices of files worth hashing: those whose size appears on both sides, EXCLUDING size 0.
+    // An empty "move" is meaningless (all empty files hash alike, so any pairing is arbitrary) and
+    // would cost a pointless open per side; empty files fall through to plain add/delete below.
+    let add_cand: Vec<usize> = (0..add_files.len())
+        .filter(|&i| add_files[i].size != 0 && contested.contains(&add_files[i].size))
+        .collect();
+    let rem_cand: Vec<usize> = (0..rm_files.len())
+        .filter(|&i| rm_files[i].size != 0 && contested.contains(&rm_files[i].size))
+        .collect();
+    progress.set_move_total((add_cand.len() + rem_cand.len()) as u64);
 
-    let add_hashes =
-        hash_candidates(src.path(), Side::Source, add_cand, add_files, &mut d.issues, &mut d.source_unreadable);
-    let rem_hashes =
-        hash_candidates(dst.path(), Side::Destination, rem_cand, rm_files, &mut d.issues, &mut d.source_unreadable);
+    // Hash the source candidates and the destination candidates. On different devices these two
+    // passes read from independent I/O paths, so run them concurrently; on one device that would
+    // only cause seek contention, so stay sequential. Each pass owns its issue buffer (merged
+    // after), and only the source pass can flag `source_unreadable`.
+    let ((add_hashes, add_issues, add_unread), (rem_hashes, rem_issues, _)) = if parallel {
+        std::thread::scope(|s| {
+            let dst_pass =
+                s.spawn(|| hash_candidates(dst.path(), Side::Destination, rem_cand, rm_files, progress));
+            let src_pass = hash_candidates(src.path(), Side::Source, add_cand, add_files, progress);
+            (src_pass, dst_pass.join().expect("destination hashing thread panicked"))
+        })
+    } else {
+        (
+            hash_candidates(src.path(), Side::Source, add_cand, add_files, progress),
+            hash_candidates(dst.path(), Side::Destination, rem_cand, rm_files, progress),
+        )
+    };
+    d.issues.extend(add_issues);
+    d.issues.extend(rem_issues);
+    if add_unread {
+        d.source_unreadable = true;
+    }
 
     // content hash → queue of remove indices with that content (queue handles duplicate content)
     let mut by_hash: HashMap<[u8; 32], VecDeque<usize>> = HashMap::new();
@@ -395,16 +443,17 @@ fn hash_candidates(
     side: Side,
     cand: Vec<usize>,
     files: &[&Entry],
-    issues: &mut Vec<String>,
-    source_unreadable: &mut bool,
-) -> Vec<(usize, [u8; 32])> {
+    progress: &CompareProgress,
+) -> (Vec<(usize, [u8; 32])>, Vec<String>, bool) {
     let mut out = Vec::with_capacity(cand.len());
+    let mut issues = Vec::new();
+    let mut source_unreadable = false;
     for i in cand {
         match hash::hash_file(&root.join(&files[i].rel)) {
             Ok(h) => out.push((i, *h.as_bytes())),
             Err(e) => {
                 if matches!(side, Side::Source) {
-                    *source_unreadable = true;
+                    source_unreadable = true;
                 }
                 issues.push(format!(
                     "{}: {}: cannot hash for move-detection ({e}); treating as a plain copy/delete",
@@ -413,8 +462,9 @@ fn hash_candidates(
                 ));
             }
         }
+        progress.hashed(files[i].size); // count the attempt either way, so the bar reaches its total
     }
-    out
+    (out, issues, source_unreadable)
 }
 
 impl Diff {

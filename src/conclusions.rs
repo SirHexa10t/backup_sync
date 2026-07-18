@@ -97,6 +97,12 @@ pub struct Conclusions {
     pub linked: usize,
     pub unchanged: usize,
 
+    /// Empty (0-byte) files among the adds and deletes. Move-detection skips size 0 (an empty
+    /// "move" is meaningless), so these are plain add/delete; the render notes that when both sides
+    /// have some — the case where they might otherwise have looked like moves.
+    pub empty_adds: u64,
+    pub empty_removes: u64,
+
     // C — per top-level folder (biggest byte losses first).
     pub folders: Vec<FolderDelta>,
 
@@ -144,6 +150,14 @@ pub fn analyze(d: &Diff, src_m: &Manifest, dst_m: &Manifest) -> Conclusions {
         .collect();
     c.deleted_files = deleted_files.len() as u64;
     c.deleted_bytes = deleted_files.iter().map(|f| f.bytes).sum();
+
+    // Empty (0-byte) files on each side — excluded from move-detection (see `diff::detect_moves`).
+    c.empty_adds = d
+        .added
+        .iter()
+        .filter(|ch| ch.kind == Kind::File && src_size.get(ch.rel.as_path()).copied().unwrap_or(0) == 0)
+        .count() as u64;
+    c.empty_removes = deleted_files.iter().filter(|f| f.bytes == 0).count() as u64;
 
     // --- A1: whole deleted subtrees = shallowest removed dirs (no removed-dir ancestor) ---
     let removed_dir_set: HashSet<&Path> =
@@ -336,6 +350,18 @@ impl Conclusions {
             self.unchanged
         );
         let _ = writeln!(s);
+
+        // Empty files: distinct note when both sides have some (where they might otherwise have
+        // looked like moves) — move-detection deliberately skips size 0.
+        if self.empty_adds > 0 && self.empty_removes > 0 {
+            let _ = writeln!(
+                s,
+                "NOTE: {} empty (0-byte) file(s) to copy and {} to delete are handled as plain \
+                 add/delete — NO move was attempted, because a size of 0 has no content to match.",
+                self.empty_adds, self.empty_removes
+            );
+            let _ = writeln!(s);
+        }
 
         // C — per top-level folder.
         if !self.folders.is_empty() {
@@ -629,6 +655,26 @@ mod tests {
         assert!(out.contains("DATA-LOSS WATCH"), "{out}");
         assert!(out.contains("deleted ENTIRELY"), "names the whole-folder deletion:\n{out}");
         assert!(out.contains("tax2019.pdf"), "orphan listed:\n{out}");
+    }
+
+    #[test]
+    fn empty_files_get_the_distinct_no_move_note() {
+        // an empty file added at one path and an empty file deleted at another — same (zero) size,
+        // so under the old behavior they'd have been paired as a move; now they're add/delete.
+        let src = Manifest::from_sorted(vec![file("keep.txt", 5), file("new_empty", 0)]);
+        let dst = Manifest::from_sorted(vec![file("keep.txt", 5), file("old_empty", 0)]);
+        let d = Diff {
+            added: vec![Change { rel: PathBuf::from("new_empty"), kind: Kind::File }],
+            removed: vec![removed("old_empty", Kind::File)],
+            ..Diff::default()
+        };
+        let c = analyze(&d, &src, &dst);
+        assert_eq!((c.empty_adds, c.empty_removes), (1, 1));
+        let out = c.render("/s", "/d");
+        assert!(
+            out.contains("NO move was attempted") && out.contains("0-byte"),
+            "the distinct size-0 note must appear:\n{out}"
+        );
     }
 
     #[test]
