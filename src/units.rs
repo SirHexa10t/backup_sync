@@ -24,6 +24,19 @@ pub(crate) fn signed_bytes(n: i64) -> String {
     format!("{sign}{}", human_bytes(n.unsigned_abs()))
 }
 
+/// Counts → `1,234,567`: digit-grouped for readability (file counts get large on big trees).
+pub(crate) fn human_count(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Elapsed time → `45s` / `2m5s` / `1h1m`.
 pub(crate) fn human_elapsed(d: Duration) -> String {
     let s = d.as_secs();
@@ -53,6 +66,14 @@ mod tests {
     fn signed_bytes_carry_their_sign() {
         assert_eq!(signed_bytes(4 << 20), "+4.0 MiB");
         assert_eq!(signed_bytes(-(3 << 10)), "-3.0 KiB");
+    }
+
+    #[test]
+    fn counts_are_digit_grouped() {
+        assert_eq!(human_count(0), "0");
+        assert_eq!(human_count(999), "999");
+        assert_eq!(human_count(1_000), "1,000");
+        assert_eq!(human_count(1_234_567), "1,234,567");
     }
 
     #[test]

@@ -11,6 +11,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use super::errors::LazyErrors;
+use crate::units::human_count;
 
 #[derive(Default)]
 pub struct Report {
@@ -134,8 +135,10 @@ impl Report {
                 Some((done, total)) => {
                     let _ = writeln!(
                         sink,
-                        "run stopped early by request — {done} of {total} planned action(s) done; \
-                         the mirror is incomplete, re-run to finish"
+                        "run stopped early by request — {} of {} planned action(s) done; \
+                         the mirror is incomplete, re-run to finish",
+                        human_count(done as u64),
+                        human_count(total as u64)
                     );
                 }
                 None => {
@@ -185,7 +188,9 @@ impl Report {
         }
         if let Some((done, total)) = self.stopped_early {
             s.push_str(&format!(
-                "STOPPED EARLY by request — {done}/{total} actions done; re-run to finish\n"
+                "STOPPED EARLY by request — {}/{} actions done; re-run to finish\n",
+                human_count(done as u64),
+                human_count(total as u64)
             ));
         }
         s

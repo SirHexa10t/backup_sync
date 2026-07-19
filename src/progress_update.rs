@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
-use crate::units::{human_bytes, human_elapsed};
+use crate::units::{human_bytes, human_count, human_elapsed};
 
 pub struct Progress {
     bar: Option<ProgressBar>,
@@ -30,8 +30,18 @@ impl Progress {
     }
 
     /// A live bar for a sync: the bar itself tracks the bytes to copy (the time-dominating work);
-    /// the message counts actions (renames/deletes/creates/copies) as they complete.
+    /// the message counts actions (renames/deletes/creates/copies) as they complete. Above it, a
+    /// one-line reminder that Ctrl+C stops the run CLEANLY (unix), so nobody hard-kills a sync out
+    /// of caution.
     pub fn for_sync(copy_bytes: u64, total_actions: u64) -> Self {
+        #[cfg(unix)]
+        if std::io::stderr().is_terminal() {
+            eprintln!(
+                "filesync: Ctrl+C stops the run cleanly — the file in flight completes and the \
+                 reports written so far are kept (renamed with an '-interrupted' marker); a \
+                 second Ctrl+C aborts immediately"
+            );
+        }
         let bar = ProgressBar::new(copy_bytes);
         bar.set_style(
             ProgressStyle::with_template(
@@ -80,8 +90,8 @@ impl Progress {
         if let Some(b) = &self.bar {
             b.set_message(format!(
                 "{}/{} actions",
-                self.done_actions.load(Ordering::Relaxed),
-                self.total_actions
+                human_count(self.done_actions.load(Ordering::Relaxed)),
+                human_count(self.total_actions)
             ));
         }
     }
@@ -143,7 +153,7 @@ impl ScanProgress {
             ScanMode::Terminal(bar) => {
                 // refresh the text every 64 entries — the steady tick redraws it at 200ms anyway
                 if self.entries % 64 == 0 {
-                    bar.set_message(format!("{} entries  {}", self.entries, human_bytes(self.bytes)));
+                    bar.set_message(format!("{} entries  {}", human_count(self.entries), human_bytes(self.bytes)));
                 }
             }
             ScanMode::Log { root, last_heartbeat } => {
@@ -151,7 +161,7 @@ impl ScanProgress {
                     *last_heartbeat = Instant::now();
                     eprintln!(
                         "filesync: scanning {root}: {} entries, {} so far",
-                        self.entries,
+                        human_count(self.entries),
                         human_bytes(self.bytes)
                     );
                 }
@@ -166,7 +176,7 @@ impl ScanProgress {
             ScanMode::Terminal(bar) => bar.finish_and_clear(),
             ScanMode::Log { root, .. } => eprintln!(
                 "filesync: scanned {root}: {} entries ({}) in {}",
-                self.entries,
+                human_count(self.entries),
                 human_bytes(self.bytes),
                 human_elapsed(self.started.elapsed())
             ),
@@ -264,9 +274,9 @@ impl CompareProgress {
             if f == 1 || f % 16 == 0 {
                 let total = self.move_total.load(Ordering::Relaxed);
                 bar.set_message(if total > 0 {
-                    format!("{f}/{total} files, {} hashed", human_bytes(b))
+                    format!("{}/{} files, {} hashed", human_count(f), human_count(total), human_bytes(b))
                 } else {
-                    format!("{f} files, {} hashed", human_bytes(b))
+                    format!("{} files, {} hashed", human_count(f), human_bytes(b))
                 });
             }
         }
@@ -279,7 +289,8 @@ impl CompareProgress {
         match &self.mode {
             CompareMode::Terminal(bar) => bar.finish_and_clear(),
             CompareMode::Log if files > 0 => eprintln!(
-                "filesync: compared {files} file(s) ({}) in {}",
+                "filesync: compared {} file(s) ({}) in {}",
+                human_count(files),
                 human_bytes(self.bytes.load(Ordering::Relaxed)),
                 human_elapsed(self.started.elapsed())
             ),

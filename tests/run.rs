@@ -455,6 +455,61 @@ fn suspension_defers_renames_onto_occupied_targets() {
     );
 }
 
+/// A gracefully-stopped sync (one SIGTERM) must leave its partial record renamed with the
+/// `-interrupted` marker and list the written files explicitly. Subprocess + real signal; the
+/// timing race is guarded — if the signal lands outside the graceful window (run already finished,
+/// or still scanning where SIGTERM is a plain kill), the test skips rather than flakes.
+#[cfg(unix)]
+#[test]
+fn graceful_stop_renames_reports_with_interrupted_marker() {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    for i in 0..4000 {
+        fs::write(src.path().join(format!("f{i:04}.bin")), vec![0u8; 4096]).unwrap();
+    }
+
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_filesync"))
+        .args(["sync", "--from"])
+        .arg(src.path())
+        .arg("--to")
+        .arg(dst.path())
+        .arg("--report")
+        .arg(out.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn filesync");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+    let output = child.wait_with_output().expect("wait for filesync");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    if !stdout.contains("stopped early") {
+        eprintln!("skipping: the signal landed outside the graceful window (run too fast/slow)");
+        return;
+    }
+    assert!(!output.status.success(), "an interrupted mirror must exit non-zero");
+    // the summary lists the partial-run files explicitly …
+    assert!(
+        stdout.contains("these files record the partial run"),
+        "explicit file inventory expected:\n{stdout}"
+    );
+    assert!(stdout.contains("-interrupted"), "listed paths carry the marker:\n{stdout}");
+    // … and on disk, the report carries the marker, the stop note, and the partial counts
+    let renamed = find_output(out.path(), "-interrupted.findings.txt")
+        .expect("renamed report file on disk");
+    let rep = fs::read_to_string(renamed).unwrap();
+    assert!(rep.contains("run stopped early by request"), "{rep}");
+    assert!(rep.contains("this run was interrupted"), "the appended rename note:\n{rep}");
+    assert!(
+        find_output(out.path(), "-interrupted.errors.txt").is_none(),
+        "no issues → no errors file, interrupted or not"
+    );
+}
+
 /// Audit finding #2b: the backup dir receives writes, so it must never be inside the read-only
 /// source. Rejected before anything is copied, deleted, or created.
 #[test]

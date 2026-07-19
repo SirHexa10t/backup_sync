@@ -185,11 +185,15 @@ A `sync` can take a long time. To stop one **gracefully** — without abandoning
 - **`Ctrl+C`** (interactive), or **`kill <pid>`** (from another terminal / a script; the PID is in
   the destination's `.filesync.lock`).
 
-On the first signal filesync **finishes the file it's currently writing, then stops before the next
-one** — it doesn't start any further copies, renames, or deletes. It still runs the finalize over
-what it did: the durability flush and the verify pass, and a report that ends with
-`run stopped early by request — N of M planned action(s) done`. The run exits **non-zero**, because
-the mirror is incomplete — just re-run to finish (only the unfinished work is redone).
+(A one-line reminder of this appears above the progress bar when the copy phase starts.) On the
+first signal filesync **finishes the file it's currently writing, then stops before the next one**
+— it doesn't start any further copies, renames, or deletes. It still runs the finalize over what it
+did: the durability flush and the verify pass, and a report that ends with
+`run stopped early by request — N of M planned action(s) done`. The output files written so far are
+**renamed with an `-interrupted` marker** (`…-interrupted.findings.txt`), so a partial record is
+never mistaken for a complete one, and the summary lists exactly which files record the partial run
+(or says none were written). The run exits **non-zero**, because the mirror is incomplete — just
+re-run to finish (only the unfinished work is redone).
 
 Press **`Ctrl+C` again** (or signal again) to **abort immediately**, if you don't want to wait for a
 large in-flight file. That's a hard stop — safe too (writes are atomic and the run resumes), it just

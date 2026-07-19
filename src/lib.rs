@@ -383,6 +383,16 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> u8 {
 
     report.finish();
 
+    // A gracefully-stopped run's output files get an `-interrupted` marker in their names, so a
+    // partial record is never mistaken for a complete one; the summary then lists them explicitly.
+    let (paths, stoppers) = if report.was_stopped_early() {
+        let renamed = reports::rename_interrupted(&paths);
+        let stoppers = stoppers.map(|(_, n)| (renamed.showstoppers.clone(), n));
+        (renamed, stoppers)
+    } else {
+        (paths, stoppers)
+    };
+
     // The end-of-run terminal summary is reports/' business (crate::reports::sync_cmd).
     reports::sync_cmd::print_summary(&report, &paths, &stoppers, runtime::elevation::available());
 

@@ -42,6 +42,10 @@ pub(crate) fn write_showstoppers(
 /// The end-of-run terminal summary: the report's counts (+ skips, root assists), where the report
 /// and showstoppers files went, the issues (pointer to the errors file, or inline when no file
 /// could back them), and — when permission walls were hit without root in reserve — the sudo hint.
+///
+/// A gracefully-stopped run gets an explicit inventory instead of the usual pointers: which files
+/// record the partial run (their paths already carry the `-interrupted` marker — the caller
+/// renames before printing), or that none were written.
 pub(crate) fn print_summary(
     report: &Report,
     paths: &OutputPaths,
@@ -49,24 +53,58 @@ pub(crate) fn print_summary(
     elevation_available: bool,
 ) {
     print!("{}", report.render());
-    if report.has_file() {
-        println!("report: {}", paths.report.display());
-    }
-    if let Some((path, total)) = stoppers {
-        println!("showstoppers: {}  ({total} item(s) — paste-able remedies inside)", path.display());
-    }
-    // Surface issues: point at the errors file if one was written, else inline (in-memory report,
-    // or the errors file couldn't be opened) so they're never lost.
-    if !report.issues.is_empty() {
-        match report.errors_file() {
-            Some(p) => println!("issues: {} — see {}", report.issues.len(), p.display()),
-            None => {
-                for i in &report.issues {
-                    println!("  ! {i}");
+
+    if report.was_stopped_early() {
+        let mut files: Vec<(&str, &std::path::Path)> = Vec::new();
+        if report.has_file() {
+            files.push(("report:", paths.report.as_path()));
+        }
+        if report.errors_file().is_some() {
+            files.push(("errors:", paths.errors.as_path()));
+        }
+        if stoppers.is_some() {
+            files.push(("showstoppers:", paths.showstoppers.as_path()));
+        }
+        if files.is_empty() {
+            println!("stopped early — no report files were written");
+        } else {
+            println!("stopped early — these files record the partial run:");
+            for (label, p) in &files {
+                println!("  {label:<13} {}", p.display());
+            }
+        }
+        // issues are inside the errors file listed above; inline them only when no file holds them
+        if !report.issues.is_empty() && report.errors_file().is_none() {
+            for i in &report.issues {
+                println!("  ! {i}");
+            }
+        }
+    } else {
+        if report.has_file() {
+            println!("report: {}", paths.report.display());
+        }
+        if let Some((path, total)) = stoppers {
+            println!(
+                "showstoppers: {}  ({total} item(s) — paste-able remedies inside)",
+                path.display()
+            );
+        }
+        // Surface issues: point at the errors file if one was written, else inline (in-memory
+        // report, or the errors file couldn't be opened) so they're never lost.
+        if !report.issues.is_empty() {
+            match report.errors_file() {
+                Some(_) => {
+                    println!("issues: {} — see {}", report.issues.len(), paths.errors.display())
+                }
+                None => {
+                    for i in &report.issues {
+                        println!("  ! {i}");
+                    }
                 }
             }
         }
     }
+
     // Permission walls with no root in reserve: say, once, how to let filesync handle them.
     if !elevation_available && report.issues.iter().any(|i| i.contains("Permission denied")) {
         println!(
