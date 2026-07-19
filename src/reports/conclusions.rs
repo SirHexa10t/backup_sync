@@ -561,6 +561,8 @@ mod tests {
             mtime: None,
             link_target: None,
             link_id: None,
+            owner: None,
+            mode: None,
         }
     }
     fn dir(rel: &str) -> Entry {

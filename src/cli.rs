@@ -59,6 +59,14 @@ pub struct Common {
     /// outside the source are copied verbatim.
     #[arg(long)]
     pub relative_symlinks: bool,
+
+    /// Never use root, even when launched under sudo (privileges are dropped permanently at
+    /// startup). Without this flag, a sudo-launched filesync still runs as your user but holds
+    /// root in reserve to get past permission walls (unreadable/undeletable files) at known
+    /// operations only; every use is recorded in the report, and existing files' ownership and
+    /// permissions are never modified.
+    #[arg(long)]
+    pub unelevated: bool,
 }
 
 #[derive(Args, Debug)]
@@ -112,7 +120,7 @@ mod tests {
     fn parses_sync_with_all_flags() {
         let cli = Cli::try_parse_from([
             "filesync", "sync", "--from", "/a", "--to", "/b", "--eager-checksum", "--no-verify",
-            "--fsync-each", "--backup-dir", "/trash", "--relative-symlinks",
+            "--fsync-each", "--backup-dir", "/trash", "--relative-symlinks", "--unelevated",
         ])
         .unwrap();
         match cli.command {
@@ -122,9 +130,19 @@ mod tests {
                 assert!(a.common.eager_checksum && a.no_verify && a.fsync_each);
                 assert_eq!(a.backup_dir, Some(PathBuf::from("/trash")));
                 assert!(a.common.relative_symlinks);
+                assert!(a.common.unelevated);
             }
             _ => panic!("expected sync"),
         }
+    }
+
+    #[test]
+    fn unelevated_parses_on_both_commands_and_defaults_off() {
+        let d = Cli::try_parse_from(["filesync", "diff", "--from", "/a", "--to", "/b", "--unelevated"])
+            .unwrap();
+        assert!(d.command.common().unelevated, "diff reads too — the flag applies to it");
+        let s = Cli::try_parse_from(["filesync", "sync", "--from", "/a", "--to", "/b"]).unwrap();
+        assert!(!s.command.common().unelevated, "root use (under sudo) is the default");
     }
 
     #[test]

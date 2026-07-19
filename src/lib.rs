@@ -8,9 +8,9 @@
 
 pub mod apply;
 pub mod cli;
-pub mod conclusions;
 pub mod diff;
 pub mod durability;
+pub mod elevation;
 pub mod hash;
 pub mod interrupt;
 pub mod links;
@@ -18,7 +18,7 @@ pub mod lock;
 pub mod manifest;
 pub mod plan;
 pub mod progress;
-pub mod report;
+pub mod reports;
 pub mod scan;
 pub mod target;
 
@@ -34,6 +34,13 @@ use manifest::{DstRoot, Kind, SrcRoot};
 /// is why it returns a plain exit code (`0` = success) rather than the opaque `process::ExitCode`.
 pub fn run(cli: Cli) -> u8 {
     let common = cli.command.common();
+
+    // FIRST, before any filesystem access: settle the privilege model. Under sudo this drops to
+    // the invoking user (root kept in reserve unless --unelevated); as plain root it refuses.
+    if let Err(msg) = elevation::init(common.unelevated) {
+        eprintln!("filesync: {msg}");
+        return 1;
+    }
 
     if let Err(msg) = validate_roots(&common.from, &common.to) {
         eprintln!("filesync: {msg}");
@@ -119,36 +126,69 @@ pub fn run(cli: Cli) -> u8 {
             // source view is incomplete — an unreadable directory (scan) or an unreadable file
             // caught during classification (`d.source_unreadable`). High-signal, so it goes on the
             // terminal, not just the file.
+            // Renames onto occupied targets are also deferred by a sync (their target-clearing
+            // deletes are suspended, and a raw rename would erase the occupant) — count them so
+            // the preview matches what run_sync would actually do.
+            let occupied_renames = if src_scan_incomplete || d.source_unreadable {
+                let dst_paths: std::collections::HashSet<&Path> =
+                    dst_m.iter().map(|e| e.rel.as_path()).collect();
+                d.moved.iter().filter(|m| dst_paths.contains(m.to.as_path())).count()
+            } else {
+                0
+            };
             let suspend_note = ((src_scan_incomplete || d.source_unreadable)
-                && (!d.removed.is_empty() || !d.to_link.is_empty()))
+                && (!d.removed.is_empty() || !d.to_link.is_empty() || occupied_renames > 0))
             .then(|| {
                 format!(
                     "note: a sync would SUSPEND the {} deletion(s) and defer the {} hard-link \
-                     update(s) listed — the source was not fully readable",
+                     update(s) and {} occupied-target rename(s) listed — the source was not \
+                     fully readable",
                     d.removed.len(),
-                    d.to_link.len()
+                    d.to_link.len(),
+                    occupied_renames
                 )
             });
 
             // Build the (de-duplicated) output paths inside the chosen directory, then write the
             // three files: the full findings, the conclusions (always), and the issues (only if
             // any). A same-minute re-run gets a `-N` stem, so nothing is ever clobbered.
-            let paths = report::OutputPaths::build(&out_dir, "diff", src.path(), SystemTime::now());
+            let paths = reports::OutputPaths::build(&out_dir, "diff", src.path(), SystemTime::now());
             let (src_disp, dst_disp) =
                 (src.path().display().to_string(), dst.path().display().to_string());
 
-            let findings =
-                format!("filesync diff — comparing {src_disp} -> {dst_disp}\n\n{}", d.render(true));
-            let wrote_report = write_diag(&paths.report, &findings, "findings");
+            // Root-assisted operations (scan heals, elevated hashing) — recorded in the findings.
+            let audit = elevation::drain_audit();
 
-            let conclusions = conclusions::analyze(&d, &src_m, &dst_m).render(&src_disp, &dst_disp);
-            let wrote_conclusions = write_diag(&paths.conclusions, &conclusions, "conclusions");
+            let wrote_report = reports::findings::write_diff(
+                &paths.report,
+                &src_disp,
+                &dst_disp,
+                &d.render(true),
+                &audit,
+            );
 
-            let mut wrote_errors = false;
-            if !issues.is_empty() {
-                let body = format!("filesync diff issues (one per line)\n{}\n", issues.join("\n"));
-                wrote_errors = write_diag(&paths.errors, &body, "issues");
-            }
+            let conclusions =
+                reports::conclusions::analyze(&d, &src_m, &dst_m).render(&src_disp, &dst_disp);
+            let wrote_conclusions =
+                reports::write_diag(&paths.conclusions, &conclusions, "conclusions");
+
+            let wrote_errors =
+                !issues.is_empty() && reports::errors::write_diff_errors(&paths.errors, &issues);
+
+            // The showstoppers file: what blocks a faithful mirror, as paste-able remedies.
+            // Written by both commands, only when there is something to show.
+            let stoppers = reports::showstoppers::analyze(
+                &src,
+                &src_m,
+                &src_scan.denied,
+                &dst,
+                &dst_m,
+                &dst_scan.denied,
+                &d,
+                elevation::available(),
+            );
+            let wrote_stoppers = !stoppers.is_empty()
+                && reports::write_diag(&paths.showstoppers, &stoppers.render(), "showstoppers");
 
             // Terminal: the compact count summary, the suspension preview, and where the detail
             // went — never the full dump.
@@ -162,6 +202,14 @@ pub fn run(cli: Cli) -> u8 {
             if wrote_conclusions {
                 println!("{:<12} {}", "conclusions:", paths.conclusions.display());
             }
+            if wrote_stoppers {
+                println!(
+                    "{:<12} {}  ({} item(s) — paste-able remedies inside)",
+                    "showstoppers:",
+                    paths.showstoppers.display(),
+                    stoppers.total()
+                );
+            }
             if !issues.is_empty() {
                 if wrote_errors {
                     println!("{:<12} {}  ({} issue(s))", "issues:", paths.errors.display(), issues.len());
@@ -171,6 +219,16 @@ pub fn run(cli: Cli) -> u8 {
                         println!("  ! {i}");
                     }
                 }
+            }
+            if !audit.is_empty() {
+                println!("root-assisted: {} operation(s) — recorded in the findings file", audit.len());
+            }
+            if !elevation::available() && issues.iter().any(|i| i.contains("Permission denied")) {
+                println!(
+                    "hint: permission-denied issues — run under `sudo filesync` to let it handle \
+                     restricted-access files (root is used only at those walls, and every use is \
+                     recorded), or fix them manually."
+                );
             }
             0
         }
@@ -286,12 +344,28 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> u8 {
     // Open the (streamed) report — never truncating a previous one (the stem is de-duplicated) —
     // and fall back to in-memory if the file can't be created. The errors file (companion, opened
     // lazily on the first issue) shares the stem.
-    let paths = report::OutputPaths::build(&out_dir, "sync", src.path(), SystemTime::now());
+    let paths = reports::OutputPaths::build(&out_dir, "sync", src.path(), SystemTime::now());
     let context = format!("sync {} -> {}", src.path().display(), dst.path().display());
-    let mut report = report::Report::create(&paths.report, &paths.errors, &context).unwrap_or_else(|e| {
+    let mut report = reports::Report::create(&paths.report, &paths.errors, &context).unwrap_or_else(|e| {
         eprintln!("filesync sync: cannot open report {} ({e}); continuing without a report file", paths.report.display());
-        report::Report::new()
+        reports::Report::new()
     });
+
+    // The showstoppers forecast: permission walls this run will hit (or, under sudo, the ones
+    // that already resisted root). Written before apply, so even an interrupted run leaves it.
+    let stoppers = reports::showstoppers::analyze(
+        src,
+        &src_m,
+        &src_scan.denied,
+        dst,
+        &dst_m,
+        &dst_scan.denied,
+        &d,
+        elevation::available(),
+    );
+    let stoppers_path = (!stoppers.is_empty()
+        && reports::write_diag(&paths.showstoppers, &stoppers.render(), "showstoppers"))
+    .then(|| paths.showstoppers.clone());
 
     // Anything the diff couldn't examine as intended (it degraded safely instead of aborting).
     for issue in &d.issues {
@@ -331,8 +405,22 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> u8 {
         // Hard-link updates can clear an existing destination name (a delete in disguise), so
         // they're deferred too — the next fully-readable run performs them.
         let links = actions.iter().filter(|x| matches!(x, plan::Action::HardLink { .. })).count();
-        actions.retain(|x| {
-            !matches!(x, plan::Action::Delete(_) | plan::Action::HardLink { .. })
+        // A rename lands via a raw fs::rename, which silently REPLACES a file/symlink already at
+        // the target. Normally the plan clears a wrong-kind occupant first (a Delete — moved
+        // aside under --backup-dir); with those deletes suspended, the rename itself would erase
+        // the occupant with no record and no backup. Defer exactly the renames whose target is
+        // currently occupied — the occupant might be the last copy of data the unreadable part
+        // of the source is hiding.
+        let dst_paths: std::collections::HashSet<&Path> =
+            dst_m.iter().map(|e| e.rel.as_path()).collect();
+        let mut deferred_renames: Vec<(PathBuf, PathBuf)> = Vec::new();
+        actions.retain(|x| match x {
+            plan::Action::Delete(_) | plan::Action::HardLink { .. } => false,
+            plan::Action::Rename { from, to } if dst_paths.contains(to.as_path()) => {
+                deferred_renames.push((from.clone(), to.clone()));
+                false
+            }
+            _ => true,
         });
         if deletes > 0 {
             report.issue_msg(format!(
@@ -344,6 +432,21 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> u8 {
             report.issue_msg(format!(
                 "{links} hard-link update(s) deferred until the source is fully readable"
             ));
+        }
+        if !deferred_renames.is_empty() {
+            report.issue_msg(format!(
+                "{} rename(s) deferred until the source is fully readable — each target path is \
+                 occupied at the destination, its clearing delete is suspended, and a raw rename \
+                 would silently erase the occupant",
+                deferred_renames.len()
+            ));
+            for (from, to) in &deferred_renames {
+                report.issue_msg(format!(
+                    "deferred rename: {} -> {} (target occupied)",
+                    from.display(),
+                    to.display()
+                ));
+            }
         }
 
         // Deletes normally free space before the copies run; with deletions suspended, look ahead
@@ -392,11 +495,23 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> u8 {
     apply::apply(src, dst, &src_m, &actions, &opts, &mut report, &prog, interrupt::global());
     prog.finish();
 
+    // The accountability trail: every operation root helped with (scan heals included).
+    for m in elevation::drain_audit() {
+        report.root_op(m);
+    }
+
     report.finish();
 
     print!("{}", report.render());
     if report.has_file() {
         println!("report: {}", paths.report.display());
+    }
+    if let Some(p) = &stoppers_path {
+        println!(
+            "showstoppers: {}  ({} item(s) — paste-able remedies inside)",
+            p.display(),
+            stoppers.total()
+        );
     }
     // Surface issues: point at the errors file if one was written, else inline (in-memory report,
     // or the errors file couldn't be opened) so they're never lost.
@@ -409,6 +524,14 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> u8 {
                 }
             }
         }
+    }
+    // Permission walls with no root in reserve: say, once, how to let filesync handle them.
+    if !elevation::available() && report.issues.iter().any(|i| i.contains("Permission denied")) {
+        println!(
+            "hint: permission-denied issues above — run under `sudo filesync` to let it handle \
+             restricted-access files (it drops to your user and uses root only at those walls, \
+             recording every use), or fix them manually."
+        );
     }
 
     // A requested early stop leaves the mirror incomplete → exit non-zero, like issues, so a script
@@ -458,27 +581,6 @@ fn resolve_output_dir(
         ));
     }
     Ok(dir)
-}
-
-/// Write a `diff` diagnostic file, reporting (but never failing the run on) an I/O error. Returns
-/// whether the file was written. `label` names the file kind for the error message.
-fn write_diag(path: &Path, content: &str, label: &str) -> bool {
-    match write_fresh(path, content) {
-        Ok(()) => true,
-        Err(e) => {
-            eprintln!("filesync diff: cannot write {label} to {} ({e})", path.display());
-            false
-        }
-    }
-}
-
-/// Write `content` to a brand-new file at `path`, never overwriting (`create_new`). Used for the
-/// `diff` command's one-shot findings/conclusions/errors files (sync streams its report instead).
-fn write_fresh(path: &Path, content: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut f = fs::File::create_new(path)?;
-    f.write_all(content.as_bytes())?;
-    f.flush()
 }
 
 /// Validate the source/destination pair before doing anything. Rejects a non-directory source and
@@ -895,6 +997,8 @@ mod tests {
             mtime: None,
             link_target: None,
             link_id: None,
+            owner: None,
+            mode: None,
         };
         let m = Manifest::from_sorted(vec![entry("a", 100), entry("b", 7)]);
         let actions = vec![

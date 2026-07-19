@@ -59,6 +59,11 @@ pub struct Entry {
     /// (`nlink > 1`, unix). Entries sharing this value are the same file under different names.
     /// Free to collect: it comes from the stat the scan already performs.
     pub link_id: Option<(u64, u64)>,
+    /// Owner `(uid, gid)` and raw `st_mode` bits (unix; `None` elsewhere or when the stat failed).
+    /// Also free from the scan's existing stat — showstopper predictions ("can this process read/
+    /// write/delete that?") are pure arithmetic over these, no extra syscalls.
+    pub owner: Option<(u32, u32)>,
+    pub mode: Option<u32>,
 }
 
 /// A scanned tree: entries sorted by relative path.

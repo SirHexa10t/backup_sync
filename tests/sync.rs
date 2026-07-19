@@ -14,7 +14,7 @@ use filesync::diff::{diff, DiffOptions};
 use filesync::manifest::{DstRoot, Kind, SrcRoot};
 use filesync::plan::{plan, Action};
 use filesync::progress::{CompareProgress, Progress};
-use filesync::report::Report;
+use filesync::reports::Report;
 use filesync::scan::scan;
 
 fn dirs() -> (tempfile::TempDir, tempfile::TempDir) {

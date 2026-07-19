@@ -70,6 +70,11 @@ pub struct Diff {
     /// like an unreadable source directory: suspend deletions. (Destination-side read failures
     /// don't set it — they can't cause a wrong deletion.)
     pub source_unreadable: bool,
+    /// Rel paths of PERMISSION-class read failures during classification, per side — the
+    /// structured feed for the showstoppers file (the `issues` strings carry the same events in
+    /// human form).
+    pub denied_source: Vec<PathBuf>,
+    pub denied_dest: Vec<PathBuf>,
 }
 
 /// Which tree a read failure occurred on — for message labeling and the source-unreadable signal.
@@ -166,6 +171,8 @@ pub fn diff(
                 opts.relative_symlinks,
                 &mut d.issues,
                 &mut d.source_unreadable,
+                &mut d.denied_source,
+                &mut d.denied_dest,
                 progress,
             ) {
                 Verdict::Unchanged => {
@@ -259,6 +266,8 @@ fn compare_entries(
     relative_symlinks: bool,
     issues: &mut Vec<String>,
     source_unreadable: &mut bool,
+    denied_source: &mut Vec<PathBuf>,
+    denied_dest: &mut Vec<PathBuf>,
     progress: &CompareProgress,
 ) -> Verdict {
     if se.kind != de.kind {
@@ -321,6 +330,9 @@ fn compare_entries(
                 // (see Diff::source_unreadable). Check it first so it wins if both sides fail.
                 (Err(e), _) => {
                     *source_unreadable = true;
+                    if crate::elevation::is_permission(&e) {
+                        denied_source.push(se.rel.clone());
+                    }
                     issues.push(format!(
                         "source: {}: cannot read to compare content ({e}); treating as changed",
                         se.rel.display()
@@ -328,6 +340,9 @@ fn compare_entries(
                     Verdict::Changed
                 }
                 (_, Err(e)) => {
+                    if crate::elevation::is_permission(&e) {
+                        denied_dest.push(de.rel.clone());
+                    }
                     issues.push(format!(
                         "destination: {}: cannot read to compare content ({e}); treating as changed",
                         se.rel.display()
@@ -384,21 +399,24 @@ fn detect_moves(
     // passes read from independent I/O paths, so run them concurrently; on one device that would
     // only cause seek contention, so stay sequential. Each pass owns its issue buffer (merged
     // after), and only the source pass can flag `source_unreadable`.
-    let ((add_hashes, add_issues, add_unread), (rem_hashes, rem_issues, _)) = if parallel {
-        std::thread::scope(|s| {
-            let dst_pass =
-                s.spawn(|| hash_candidates(dst.path(), Side::Destination, rem_cand, rm_files, progress));
-            let src_pass = hash_candidates(src.path(), Side::Source, add_cand, add_files, progress);
-            (src_pass, dst_pass.join().expect("destination hashing thread panicked"))
-        })
-    } else {
-        (
-            hash_candidates(src.path(), Side::Source, add_cand, add_files, progress),
-            hash_candidates(dst.path(), Side::Destination, rem_cand, rm_files, progress),
-        )
-    };
+    let ((add_hashes, add_issues, add_denied, add_unread), (rem_hashes, rem_issues, rem_denied, _)) =
+        if parallel {
+            std::thread::scope(|s| {
+                let dst_pass = s
+                    .spawn(|| hash_candidates(dst.path(), Side::Destination, rem_cand, rm_files, progress));
+                let src_pass = hash_candidates(src.path(), Side::Source, add_cand, add_files, progress);
+                (src_pass, dst_pass.join().expect("destination hashing thread panicked"))
+            })
+        } else {
+            (
+                hash_candidates(src.path(), Side::Source, add_cand, add_files, progress),
+                hash_candidates(dst.path(), Side::Destination, rem_cand, rm_files, progress),
+            )
+        };
     d.issues.extend(add_issues);
     d.issues.extend(rem_issues);
+    d.denied_source.extend(add_denied);
+    d.denied_dest.extend(rem_denied);
     if add_unread {
         d.source_unreadable = true;
     }
@@ -444,9 +462,10 @@ fn hash_candidates(
     cand: Vec<usize>,
     files: &[&Entry],
     progress: &CompareProgress,
-) -> (Vec<(usize, [u8; 32])>, Vec<String>, bool) {
+) -> (Vec<(usize, [u8; 32])>, Vec<String>, Vec<PathBuf>, bool) {
     let mut out = Vec::with_capacity(cand.len());
     let mut issues = Vec::new();
+    let mut denied = Vec::new();
     let mut source_unreadable = false;
     for i in cand {
         match hash::hash_file(&root.join(&files[i].rel)) {
@@ -454,6 +473,9 @@ fn hash_candidates(
             Err(e) => {
                 if matches!(side, Side::Source) {
                     source_unreadable = true;
+                }
+                if crate::elevation::is_permission(&e) {
+                    denied.push(files[i].rel.clone());
                 }
                 issues.push(format!(
                     "{}: {}: cannot hash for move-detection ({e}); treating as a plain copy/delete",
@@ -464,7 +486,7 @@ fn hash_candidates(
         }
         progress.hashed(files[i].size); // count the attempt either way, so the bar reaches its total
     }
-    (out, issues, source_unreadable)
+    (out, issues, denied, source_unreadable)
 }
 
 impl Diff {

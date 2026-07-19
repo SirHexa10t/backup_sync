@@ -73,6 +73,7 @@ filesync sync --from ~/Documents --to /mnt/backup --backup-dir /mnt/backup/.tras
 | `--eager-checksum` | both | off | Compare by file **content** (blake3) instead of size+mtime. For a thorough check, or to never miss a same-size+same-mtime change. **Re-running with this flag after a completed backup is how you hunt corruption**: a verified mirror that now differs where size and mtime still match means bytes rotted on one side — filesync calls that signature out in the report and re-copies from the source (pair with `--backup-dir` so the destination's old version survives, in case the *source* was the rotten side). |
 | `--report <DIR>` | both | current dir | Existing directory to write this run's output files into (see [The report](#the-report)). Must be outside both trees. |
 | `--include-same` | `diff` | off | Also list content-identical files (needing neither copy nor move) in the findings. Off by default — the list can be enormous. |
+| `--unelevated` | both | root **used** when launched under sudo | Never use root, even under sudo — privileges are dropped permanently at startup, and restricted-access files are reported instead of handled. See [Restricted-access files](#restricted-access-files-running-under-sudo). |
 | `--no-verify` | `sync` | verify **on** | Skip re-reading each copied file to confirm it landed correctly. |
 | `--fsync-each` | `sync` | off | Force every file to disk individually (durable-as-you-go, but ~2–17× slower). Default is one flush at the end. |
 | `--backup-dir <DIR>` | `sync` | — | Move files that would be deleted or overwritten here, instead of erasing them. Must be a **fresh** dir (absent or empty) on the **destination's filesystem**, not inside the source — one backup dir per run. It may live inside the destination: filesync marks it with a `.filesync-backup-dir` file, and never mirrors, deletes, or re-backs-up a marked dir. |
@@ -116,6 +117,7 @@ stderr — into files plus the terminal. The files share one timestamped stem:
 ./filesync-<command>-<source>-<YYYY-mm-DD_HHMM>.findings.txt      # what would change / did change
 ./filesync-<command>-<source>-<YYYY-mm-DD_HHMM>.errors.txt        # issues — only if any
 ./filesync-<command>-<source>-<YYYY-mm-DD_HHMM>.conclusions.txt   # diagnostics (diff only)
+./filesync-<command>-<source>-<YYYY-mm-DD_HHMM>.showstoppers.txt  # permission blockers + remedies — only if any
 ```
 
 (for example `filesync-sync-Documents-2026-07-04_1530.findings.txt`). `<command>` is `sync` or `diff`:
@@ -129,6 +131,8 @@ stderr — into files plus the terminal. The files share one timestamped stem:
   issue** — so *no errors file means a clean run*.
 - The **`.conclusions.txt`** file (written by `diff`) distils the diff into the few things worth
   looking at — see [Conclusions](#conclusions) below.
+- The **`.showstoppers.txt`** file (both commands, only if any) lists what *blocks* a faithful
+  mirror — with paste-able remedies. See [Showstoppers](#showstoppers) below.
 - **Live progress** (`… scanned …`) stays on the terminal only; it is never written to any file.
 
 `--report <DIR>` chooses the directory to write these files into (they keep their generated names);
@@ -159,7 +163,22 @@ be lost:
 - **Extremes** — the largest single additions and deletions, and a breakdown of deletions by file
   extension.
 
-## Stopping a run early
+### Showstoppers
+
+Conclusions say what a sync would *change*; **showstoppers say what prevents the mirror from
+converging** — and how to unblock it. The file collects permission blockers, separated by side and
+by needed remedy: source entries your user can't read (they **cannot be backed up**; unreadable
+directories also suspend all deletions), destination extras whose parent directory you can't write
+(mirror-delete will fail), and destination directories that must receive copies but aren't writable.
+
+Each section is a bash **array** of absolute paths (one verbose, distinct name per section), each
+line carrying an `# owner mode confidence` comment — `confirmed` means an operation actually failed
+there this run; `predicted` means it's judged from the owner/mode bits (an ACL may say otherwise).
+The array is followed by the **loop** that applies that section's remedy. Nothing in the file runs
+on its own: you paste the array, review it, then paste the loop — deliberate friction, so
+destructive fixes are a conscious act. Quoting is bash-exact (ANSI-C `$'…'` where needed), so even
+filenames containing newlines round-trip byte-perfect. Running [under sudo](#restricted-access-files-running-under-sudo)
+makes most of these disappear — the file then lists only what root couldn't or wasn't allowed to fix.
 
 A `sync` can take a long time. To stop one **gracefully** — without abandoning it mid-write — signal it:
 
@@ -177,6 +196,33 @@ large in-flight file. That's a hard stop — safe too (writes are atomic and the
 skips the clean finalize. On Windows, `Ctrl+C` is always this immediate stop (Unix signals aren't
 available there).
 
+## Restricted-access files (running under sudo)
+
+Backups routinely contain files your user can't read or delete (root-owned configs copied with
+`sudo cp`, trashed system snapshots, …). Unprivileged, filesync reports them as issues every run.
+To let it handle them unattended, launch it under sudo:
+
+```
+sudo filesync sync --from /data --to /mnt/backup
+```
+
+This does **not** run the backup as root. At startup filesync **drops to your user** and does all
+normal work unprivileged; root is held in reserve and used only to retry an operation that hit a
+**permission wall** (`EACCES`/`EPERM`) — and only at known operations: listing an unreadable
+directory, opening a file for hashing/copying/verifying, deleting a planned extra, renaming,
+creating/writing at the destination, and metadata stamping. Any other error (I/O errors, missing
+files, full or read-only filesystems, anything unforeseen) is **never** retried with root — those
+aren't permission walls, and they stay loud. Root expands *capability*, never *policy*: it does
+nothing the plan didn't already call for, and `--backup-dir` / deletion suspension apply unchanged.
+
+Guarantees: existing files' **ownership and permissions are never modified** (root reads them
+as-is); anything filesync *creates* while elevated is handed back to your user; and **every**
+root-assisted operation is recorded in the report (`root-assisted: N` + one `% root:` line each) —
+a full audit trail of where privilege was used. `--unelevated` forbids root use entirely (privileges
+are dropped permanently at startup). Launching as a bare root login (not via sudo) is refused —
+filesync needs to know which user owns the mirror. The privilege is granted once, at launch, and
+lasts the whole run — no mid-run password prompts, so multi-day unattended runs can't hang on one.
+
 ## Safety guarantees
 
 - **Source is read-only** — enforced in the code (source and destination are distinct types; only
@@ -184,9 +230,10 @@ available there).
   paths, a backup dir inside the source, and `/` as either end are all rejected.
 - **Deletions require a fully-readable source** — if any part of the source can't be read, a file
   hidden behind the error would look "deleted" and its destination twin (possibly the last copy)
-  would be mirror-deleted. Instead, **all deletions are suspended for that run** (copies and renames
-  still proceed), and the errors file says so. An entirely empty source is likewise refused — it
-  usually means a drive didn't mount.
+  would be mirror-deleted. Instead, **all deletions are suspended for that run** (copies still
+  proceed, and so do renames — except onto occupied target paths, which are deferred rather than
+  silently replacing the occupant), and the errors file says so. An entirely empty source is
+  likewise refused — it usually means a drive didn't mount.
 - **Atomic writes** — each file is written to a temp file and atomically renamed into place, so an
   interruption can never leave a half-written file masquerading as a real one.
 - **Resumable** — a re-run re-compares and only redoes what didn't complete; no persistent state to

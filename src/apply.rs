@@ -17,7 +17,7 @@ use crate::links;
 use crate::manifest::{DstRoot, Kind, Manifest, SrcRoot};
 use crate::plan::Action;
 use crate::progress::Progress;
-use crate::report::Report;
+use crate::reports::Report;
 
 /// Prefix for the temp files that atomic copies write before renaming into place. Deliberately
 /// long and specific: scans silently ignore names with this prefix (they're our scratch), so the
@@ -73,7 +73,12 @@ pub fn apply(
         }
         match action {
             Action::CreateDir(rel) => {
-                if let Err(e) = fs::create_dir_all(dst.path().join(rel)) {
+                let path = dst.path().join(rel);
+                let first = fs::create_dir_all(&path);
+                let made = crate::elevation::retry_if_permission("create directory", &path, first, || {
+                    create_dirs_user(&path)
+                });
+                if let Err(e) = made {
                     report.issue(rel.clone(), &e);
                 }
             }
@@ -184,17 +189,32 @@ pub fn apply(
 /// (and a stale hard-linked name moved into the backup shares its inode there: zero extra space).
 fn do_hard_link(dst: &DstRoot, leader: &Path, name: &Path, opts: &Options) -> io::Result<()> {
     let np = dst.path().join(name);
-    if fs::symlink_metadata(&np).is_ok() {
-        do_delete(dst, name, opts)?;
+    if stat_entry(&np).is_ok() {
+        do_delete(dst, name, opts)?; // elevated retry lives inside do_delete
     }
     if let Some(parent) = np.parent() {
-        fs::create_dir_all(parent)?;
+        let first = fs::create_dir_all(parent);
+        crate::elevation::retry_if_permission("create directory", parent, first, || {
+            create_dirs_user(parent)
+        })?;
     }
-    fs::hard_link(dst.path().join(leader), &np)
+    let lp = dst.path().join(leader);
+    let first = fs::hard_link(&lp, &np);
+    // no chown: a hard link is a new NAME for an existing inode — its ownership is the inode's
+    crate::elevation::retry_if_permission("hard link", &np, first, || fs::hard_link(&lp, &np))
 }
 
-/// Copy the source entry's mtime and (unix) permissions onto the destination entry.
+/// Copy the source entry's mtime and (unix) permissions onto the destination entry. A permission
+/// wall (e.g. the destination file is root-owned from an earlier elevated copy or an old sudo cp)
+/// is retried with root in reserve — it stamps the same source-derived metadata either way.
 fn stamp_metadata(src_abs: &Path, dst_abs: &Path) -> io::Result<()> {
+    let first = stamp_once(src_abs, dst_abs);
+    crate::elevation::retry_if_permission("refresh metadata", dst_abs, first, || {
+        stamp_once(src_abs, dst_abs)
+    })
+}
+
+fn stamp_once(src_abs: &Path, dst_abs: &Path) -> io::Result<()> {
     let md = fs::metadata(src_abs)?;
     if let Ok(mtime) = md.modified() {
         File::options().write(true).open(dst_abs).and_then(|f| f.set_modified(mtime))?;
@@ -212,7 +232,9 @@ fn stamp_metadata(src_abs: &Path, dst_abs: &Path) -> io::Result<()> {
 fn mirror_dir_metadata(src: &SrcRoot, dst: &DstRoot, src_m: &Manifest) {
     for e in src_m.iter().filter(|e| e.kind == Kind::Dir) {
         let (sp, dp) = (src.path().join(&e.rel), dst.path().join(&e.rel));
-        let (Ok(smd), Ok(dmd)) = (fs::metadata(&sp), fs::metadata(&dp)) else {
+        // source stat gets the traversal-wall retry (a dir nested under a root-owned 0700 parent);
+        // the destination side is ours
+        let (Ok(smd), Ok(dmd)) = (stat_follow(&sp), fs::metadata(&dp)) else {
             continue; // vanished or unreadable — the action loop already reported real problems
         };
         if let (Ok(sm), Ok(dm)) = (smd.modified(), dmd.modified()) {
@@ -284,12 +306,53 @@ fn is_disk_full(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::StorageFull
 }
 
+/// `symlink_metadata` with the elevation retry: when the path sits under a directory this process
+/// can't search (e.g. a root-owned 0700 dir), the WALL IS THE STAT ITSELF — it fails EACCES before
+/// any open/delete is even attempted, so it needs the same root assist as the operation proper.
+fn stat_entry(path: &Path) -> io::Result<fs::Metadata> {
+    let first = fs::symlink_metadata(path);
+    crate::elevation::retry_if_permission("stat", path, first, || fs::symlink_metadata(path))
+}
+
+/// `metadata` (follows symlinks) with the same traversal-wall retry as [`stat_entry`].
+fn stat_follow(path: &Path) -> io::Result<fs::Metadata> {
+    let first = fs::metadata(path);
+    crate::elevation::retry_if_permission("stat", path, first, || fs::metadata(path))
+}
+
+/// `create_dir_all` that hands every directory it actually CREATES to the invoking user (matters
+/// when running elevated — a root-owned dir at the destination would wall off future unprivileged
+/// runs). Unprivileged, the chown is a no-op on our own fresh dirs.
+fn create_dirs_user(path: &Path) -> io::Result<()> {
+    let mut missing: Vec<&Path> = Vec::new();
+    let mut cur = path;
+    while !cur.exists() {
+        missing.push(cur);
+        match cur.parent() {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    for dir in missing.iter().rev() {
+        match fs::create_dir(dir) {
+            Ok(()) => crate::elevation::chown_to_user(dir),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 fn do_rename(src: &SrcRoot, dst: &DstRoot, from: &Path, to: &Path) -> io::Result<()> {
     let (fp, tp) = (dst.path().join(from), dst.path().join(to));
     if let Some(parent) = tp.parent() {
-        fs::create_dir_all(parent)?;
+        let first = fs::create_dir_all(parent);
+        crate::elevation::retry_if_permission("create directory", parent, first, || {
+            create_dirs_user(parent)
+        })?;
     }
-    fs::rename(&fp, &tp)?;
+    let first = fs::rename(&fp, &tp);
+    crate::elevation::retry_if_permission("rename", &tp, first, || fs::rename(&fp, &tp))?;
     // The renamed file kept the OLD destination mtime. Refresh mtime (+ unix permissions) from
     // the source so the next run's size+mtime quick check sees the moved file as unchanged —
     // otherwise the very file the rename saved would be re-copied next run. Best-effort: a miss
@@ -300,18 +363,27 @@ fn do_rename(src: &SrcRoot, dst: &DstRoot, from: &Path, to: &Path) -> io::Result
 
 fn do_delete(dst: &DstRoot, rel: &Path, opts: &Options) -> io::Result<()> {
     let path = dst.path().join(rel);
-    let md = match fs::symlink_metadata(&path) {
+    let md = match stat_entry(&path) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()), // already gone
         Err(e) => return Err(e),
     };
     if md.is_dir() {
-        fs::remove_dir(&path) // empty by delete-order; dirs carry no data
+        // empty by delete-order; dirs carry no data
+        let first = fs::remove_dir(&path);
+        crate::elevation::retry_if_permission("delete directory", &path, first, || {
+            fs::remove_dir(&path)
+        })
     } else {
         // file or symlink
         match &opts.backup_dir {
             Some(bdir) => move_to_backup(&path, rel, bdir), // move aside instead of erasing
-            None => fs::remove_file(&path),
+            None => {
+                let first = fs::remove_file(&path);
+                crate::elevation::retry_if_permission("delete file", &path, first, || {
+                    fs::remove_file(&path)
+                })
+            }
         }
     }
 }
@@ -320,14 +392,28 @@ fn do_delete(dst: &DstRoot, rel: &Path, opts: &Options) -> io::Result<()> {
 /// mechanism behind `--backup-dir` for both deleted and overwritten files. Uses `rename`, so
 /// `bdir` must be on the same filesystem as the destination. The marker is written before the
 /// first move; if it can't be written, the move fails too (the original stays in place) — a
-/// backup dir must never exist unmarked.
+/// backup dir must never exist unmarked. An elevated retry keeps the moved entry's ownership
+/// untouched (that's the point of a backup) but hands the dirs/marker WE created to the user.
 fn move_to_backup(abs_path: &Path, rel: &Path, bdir: &Path) -> io::Result<()> {
-    ensure_backup_marker(bdir)?;
-    let target = bdir.join(rel);
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::rename(abs_path, &target)
+    let attempt = |elevated: bool| -> io::Result<()> {
+        let fresh_marker = !bdir.join(BACKUP_MARKER).exists();
+        ensure_backup_marker(bdir)?;
+        if elevated && fresh_marker {
+            crate::elevation::chown_to_user(bdir);
+            crate::elevation::chown_to_user(&bdir.join(BACKUP_MARKER));
+        }
+        let target = bdir.join(rel);
+        if let Some(parent) = target.parent() {
+            if elevated {
+                create_dirs_user(parent)?;
+            } else {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::rename(abs_path, &target)
+    };
+    let first = attempt(false);
+    crate::elevation::retry_if_permission("move to backup dir", abs_path, first, || attempt(true))
 }
 
 /// Create `bdir` (if needed) and drop [`BACKUP_MARKER`] into it, once.
@@ -363,17 +449,19 @@ fn copy_entry(
     progress: &Progress,
 ) -> io::Result<Copied> {
     let sp = src.path().join(rel);
-    let ft = fs::symlink_metadata(&sp)?.file_type();
+    let ft = stat_entry(&sp)?.file_type(); // traversal itself can be the permission wall
 
     if ft.is_symlink() {
-        let raw = fs::read_link(&sp)?;
+        let first = fs::read_link(&sp);
+        let raw =
+            crate::elevation::retry_if_permission("read symlink", &sp, first, || fs::read_link(&sp))?;
         // The target the mirror should carry (rewritten under --relative-symlinks; see links.rs).
         let target = links::desired_target(src, rel, &raw, opts.relative_symlinks);
         match recreate_symlink(&dst.path().join(rel), &target) {
             Ok(()) => {
                 // Only meaningful under --relative-symlinks, where targets were resolved anyway:
-                // note links whose chain doesn't land on anything (fs::metadata follows the chain).
-                let broken = opts.relative_symlinks && fs::metadata(&sp).is_err();
+                // note links whose chain doesn't land on anything (stat follows the chain).
+                let broken = opts.relative_symlinks && stat_follow(&sp).is_err();
                 Ok(Copied::Symlink { broken })
             }
             // An issue (not a benign skip): a symlink DOES carry information — its target. Record
@@ -405,15 +493,28 @@ fn copy_file_atomic(
     let parent = final_path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination path has no parent"))?;
-    fs::create_dir_all(parent)?;
+    let mkdirs = fs::create_dir_all(parent);
+    crate::elevation::retry_if_permission("create directory", parent, mkdirs, || {
+        create_dirs_user(parent)
+    })?;
 
     let fname = final_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let tmp = parent.join(format!("{TMP_PREFIX}{}.{fname}", std::process::id()));
 
-    let src_meta = fs::metadata(sp)?;
-    let mut hasher = blake3::Hasher::new();
-    let total = match stream_to_tmp(sp, &tmp, &mut hasher, opts.fsync_each, progress) {
-        Ok(n) => n,
+    let src_meta = stat_follow(sp)?; // the stat itself is walled under an unsearchable parent
+    // A permission wall here is at open/create time (the source opens before the temp is
+    // created), so an elevated retry restarts from zero bytes — no double-counted progress, and
+    // the temp is re-created from scratch. A temp created while elevated is handed to the user.
+    let first = stream_to_tmp(sp, &tmp, opts.fsync_each, progress);
+    let streamed = crate::elevation::retry_if_permission("copy", sp, first, || {
+        let r = stream_to_tmp(sp, &tmp, opts.fsync_each, progress);
+        if r.is_ok() {
+            crate::elevation::chown_to_user(&tmp);
+        }
+        r
+    });
+    let (total, hash) = match streamed {
+        Ok(v) => v,
         Err(e) => {
             let _ = fs::remove_file(&tmp);
             return Err(e);
@@ -440,23 +541,28 @@ fn copy_file_atomic(
         }
     }
 
-    if let Err(e) = fs::rename(&tmp, &final_path) {
+    let renamed = fs::rename(&tmp, &final_path);
+    if let Err(e) = crate::elevation::retry_if_permission("rename into place", &final_path, renamed, || {
+        fs::rename(&tmp, &final_path)
+    }) {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
     if opts.fsync_each {
         let _ = File::open(parent).and_then(|f| f.sync_all()); // persist the rename
     }
-    Ok((total, hasher.finalize()))
+    Ok((total, hash))
 }
 
+/// Stream `sp` into a fresh temp file, hashing as it goes. The hasher lives inside so a retry
+/// (e.g. elevated, after a permission wall) starts from a clean slate — never double-fed.
 fn stream_to_tmp(
     sp: &Path,
     tmp: &Path,
-    hasher: &mut blake3::Hasher,
     fsync: bool,
     progress: &Progress,
-) -> io::Result<u64> {
+) -> io::Result<(u64, blake3::Hash)> {
+    let mut hasher = blake3::Hasher::new();
     let mut reader = File::open(sp)?;
     let mut writer = File::create(tmp)?;
     let mut buf = vec![0u8; BUF];
@@ -475,16 +581,30 @@ fn stream_to_tmp(
     if fsync {
         writer.sync_all()?;
     }
-    Ok(total)
+    Ok((total, hasher.finalize()))
 }
 
 #[cfg(unix)]
 fn recreate_symlink(link_path: &Path, target: &Path) -> io::Result<()> {
-    if let Some(parent) = link_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let _ = fs::remove_file(link_path); // replace any existing entry
-    std::os::unix::fs::symlink(target, link_path)
+    let once = || -> io::Result<()> {
+        if let Some(parent) = link_path.parent() {
+            create_dirs_user(parent)?;
+        }
+        // replace any existing entry — "nothing there" is fine; a permission failure must
+        // surface (it's the retryable wall) instead of decaying into a confusing EEXIST
+        match fs::remove_file(link_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        std::os::unix::fs::symlink(target, link_path)
+    };
+    let first = once();
+    crate::elevation::retry_if_permission("create symlink", link_path, first, || {
+        once()?;
+        crate::elevation::chown_to_user(link_path); // created while elevated → user-owned
+        Ok(())
+    })
 }
 
 #[cfg(not(unix))]

@@ -177,8 +177,12 @@ Two assumptions about the source are load-bearing, so they are stated (and enfor
    degrades to copy+delete, so a to-be-deleted destination file might actually be that file's
    content under a new name. **On either — or a skipped marked backup dir — every deletion is
    suspended for that run** — copies and renames still proceed (they are additive/content-
-   preserving), and the report says what was suspended and why. (Every read-failure message names
-   its side, so "my source won't back up" is never confused with "a destination extra".)
+   preserving), and the report says what was suspended and why. One exception: a rename whose
+   target path is currently occupied at the destination is deferred along with the deletions —
+   its target-clearing delete was suspended, and a raw rename would silently replace the occupant
+   (which might itself be the last copy of something the unreadable source is hiding). (Every
+   read-failure message names its side, so "my source won't back up" is never confused with "a
+   destination extra".)
    Because deletions normally free space *before* the copies run, a suspended run also does a
    **space look-ahead**: if the destination can't fit all planned copies, the copies are skipped
    too rather than churning into a full disk.
@@ -305,6 +309,18 @@ Two firm conclusions:
    fs-sync is **~1.5× faster** than per-file fsync (72 vs 48 MiB/s; up to ~2× at some worker counts).
    The barrier is 49,152 *serialized* device flushes — a large fixed cost that dominates a small-file
    backup and swamps everything else.
+
+### Privilege model: root in reserve, never in charge
+
+Launched under sudo, filesync drops to the invoking user immediately (keeping saved-uid 0) and
+re-escalates **per operation, per thread**, only when an operation fails with `EACCES`/`EPERM` at
+one of the enumerated walls (list / read / delete / rename / create / stamp). The class test is
+deliberate: an unforeseen error must never be rammed through with privilege — `EIO` stays loud
+(dying disk), `EROFS` root can't fix, and anything unrecognized is reported, not overridden. Root
+expands *capability*, never *policy*: it performs only actions the plan already contained, existing
+files' ownership/permissions are never modified, elevated-created artifacts are chowned back to the
+user, and every assist is recorded in the report. `--unelevated` drops privileges permanently
+instead; a bare root login is refused (no `$SUDO_UID` to own the run).
 
 ### A different axis: scanning two devices at once
 

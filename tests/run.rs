@@ -25,6 +25,7 @@ fn mk_sync_cli(
                 eager_checksum: false,
                 report,
                 relative_symlinks,
+                unelevated: false,
             },
             no_verify: false,
             fsync_each: false,
@@ -35,6 +36,22 @@ fn mk_sync_cli(
 
 fn sync_cli(from: &Path, to: &Path, report: Option<PathBuf>) -> Cli {
     mk_sync_cli(from, to, report, false, None)
+}
+
+fn diff_cli(from: &Path, to: &Path, report: &Path) -> Cli {
+    Cli {
+        command: Command::Diff(filesync::cli::DiffArgs {
+            common: Common {
+                from: from.to_path_buf(),
+                to: to.to_path_buf(),
+                eager_checksum: false,
+                report: Some(report.to_path_buf()),
+                relative_symlinks: false,
+                unelevated: false,
+            },
+            include_same: false,
+        }),
+    }
 }
 
 #[test]
@@ -306,6 +323,136 @@ fn unreadable_source_file_suspends_deletes() {
     let errors = read_output(report_dir.path(), ".errors.txt");
     assert!(errors.contains("suspended"), "errors file states deletions were suspended:\n{errors}");
     assert!(errors.contains("source:"), "the unreadable source file is reported, labeled:\n{errors}");
+}
+
+/// The showstoppers file: an unreadable source file (mode 000) must be PREDICTED from the scan's
+/// owner/mode bits — before any operation even fails on it — listed as a bash array entry with a
+/// paste-able remedy loop, quoted, with the owner/mode/confidence comment.
+#[cfg(unix)]
+#[test]
+fn showstoppers_predicts_unreadable_source_file() {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    if !common::permissions_enforced(src.path()) {
+        eprintln!("skipping: permission bits not enforced (running as root?)");
+        return;
+    }
+    common::file(src.path(), "fine.txt", b"ok");
+    common::file(src.path(), "locked.bin", b"cannot-read-me"); // unique size → not a move candidate
+    common::set_no_perms(src.path(), "locked.bin");
+
+    let report_dir = tempfile::tempdir().unwrap();
+    let _ = run(diff_cli(src.path(), dst.path(), report_dir.path()));
+    common::restore_perms(src.path(), "locked.bin");
+
+    let stoppers = read_output(report_dir.path(), ".showstoppers.txt");
+    assert!(
+        stoppers.contains("filesync_source_unreadable_files=("),
+        "the verbose array is defined:\n{stoppers}"
+    );
+    let abs_src = fs::canonicalize(src.path()).unwrap();
+    let quoted = format!("'{}'", abs_src.join("locked.bin").display());
+    assert!(stoppers.contains(&quoted), "the ABSOLUTE path is quoted in the array:\n{stoppers}");
+    assert!(stoppers.contains("0000 predicted"), "mode + confidence comment:\n{stoppers}");
+    assert!(
+        stoppers.contains("for f in \"${filesync_source_unreadable_files[@]}\"; do"),
+        "the remedy loop follows the array:\n{stoppers}"
+    );
+}
+
+/// Undeletable destination extras are predicted from the PARENT directory's write bits: an extra
+/// inside a read-only dir can't be unlinked, so it lands in the showstoppers before sync fails on
+/// it. Clean runs, by contrast, must not create the file at all.
+#[cfg(unix)]
+#[test]
+fn showstoppers_predicts_undeletable_extras_and_absent_when_clean() {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    if !common::permissions_enforced(src.path()) {
+        eprintln!("skipping: permission bits not enforced (running as root?)");
+        return;
+    }
+    common::file(src.path(), "keep.txt", b"k");
+
+    // clean pass first: no showstoppers file at all
+    let clean_dir = tempfile::tempdir().unwrap();
+    let _ = run(diff_cli(src.path(), dst.path(), clean_dir.path()));
+    assert!(
+        find_output(clean_dir.path(), ".showstoppers.txt").is_none(),
+        "a clean run must not leave a showstoppers file"
+    );
+
+    // now: an extra inside a directory the user can't write into (r-x) — deletion will fail
+    common::file(dst.path(), "frozen/extra.bin", b"stale");
+    let frozen = dst.path().join("frozen");
+    let mut perms = fs::metadata(&frozen).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o555);
+    fs::set_permissions(&frozen, perms).unwrap();
+
+    let report_dir = tempfile::tempdir().unwrap();
+    let _ = run(diff_cli(src.path(), dst.path(), report_dir.path()));
+
+    // reopen for cleanup before asserting
+    let mut perms = fs::metadata(&frozen).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    fs::set_permissions(&frozen, perms).unwrap();
+
+    let stoppers = read_output(report_dir.path(), ".showstoppers.txt");
+    assert!(
+        stoppers.contains("filesync_destination_undeletable_files=("),
+        "undeletable section present:\n{stoppers}"
+    );
+    let abs_dst = fs::canonicalize(dst.path()).unwrap();
+    assert!(
+        stoppers.contains(&format!("'{}'", abs_dst.join("frozen/extra.bin").display())),
+        "the walled extra is listed by absolute path:\n{stoppers}"
+    );
+    assert!(stoppers.contains("predicted"), "{stoppers}");
+    assert!(stoppers.contains("sudo rm -- \"$f\""), "the remedy is the explicit rm loop:\n{stoppers}");
+}
+
+/// Under deletion suspension, a planned rename whose TARGET is occupied at the destination must be
+/// deferred: its target-clearing delete was suspended, and a raw `fs::rename` would silently
+/// replace the occupant (file/symlink) with no record and no --backup-dir move-aside. The occupant
+/// might be the last copy of something the unreadable part of the source is hiding.
+#[cfg(unix)]
+#[test]
+fn suspension_defers_renames_onto_occupied_targets() {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    if !common::permissions_enforced(src.path()) {
+        eprintln!("skipping: permission bits not enforced (running as root?)");
+        return;
+    }
+    // suspension trigger: an unreadable source subtree
+    common::file(src.path(), "vault/hidden.txt", b"invisible");
+    common::set_no_perms(src.path(), "vault");
+    // kind-swap + move: the source has a FILE at `swap`; the destination has a SYMLINK there,
+    // while the file's content sits at a different destination path (the move partner)
+    common::file(src.path(), "swap", b"MOVE-PAYLOAD");
+    common::file(dst.path(), "old_home.bin", b"MOVE-PAYLOAD");
+    std::os::unix::fs::symlink("anywhere", dst.path().join("swap")).unwrap();
+
+    let report_dir = tempfile::tempdir().unwrap();
+    let _ = run(sync_cli(src.path(), dst.path(), Some(report_dir.path().to_path_buf())));
+    common::restore_perms(src.path(), "vault");
+    if dst.path().join("vault").exists() {
+        common::restore_perms(dst.path(), "vault"); // dir-metadata mirroring copied the 000 mode
+    }
+
+    // the occupant survived (the rename was deferred, not executed over it) …
+    let md = fs::symlink_metadata(dst.path().join("swap")).unwrap();
+    assert!(md.file_type().is_symlink(), "the occupant at the rename target must survive");
+    // … the move partner is untouched, and nothing was deleted or renamed
+    assert_eq!(fs::read(dst.path().join("old_home.bin")).unwrap(), b"MOVE-PAYLOAD");
+    let rep = read_output(report_dir.path(), ".findings.txt");
+    assert!(rep.contains("deleted: 0"), "{rep}");
+    assert!(rep.contains("moved:   0"), "the rename must not have run:\n{rep}");
+    let errors = read_output(report_dir.path(), ".errors.txt");
+    assert!(
+        errors.contains("deferred rename") && errors.contains("old_home.bin"),
+        "the deferred rename is recorded, per-path, in the errors file:\n{errors}"
+    );
 }
 
 /// Audit finding #2b: the backup dir receives writes, so it must never be inside the read-only
