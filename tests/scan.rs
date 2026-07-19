@@ -130,7 +130,7 @@ fn scan_reports_an_unreadable_directory() {
     common::file(tmp.path(), "locked/secret.txt", b"hidden");
     common::set_no_perms(tmp.path(), "locked"); // can't list the directory's contents
 
-    let out = filesync::scan::scan_with_errors(tmp.path(), &mut filesync::progress::ScanProgress::hidden());
+    let out = filesync::scan::scan_with_errors(tmp.path(), &mut filesync::progress_update::ScanProgress::hidden());
     common::restore_perms(tmp.path(), "locked"); // let the tempdir clean itself up
 
     // readable siblings are still scanned
@@ -152,7 +152,7 @@ fn scan_skips_directories_marked_as_backup_dirs() {
     common::file(tmp.path(), "trash/.filesync-backup-dir", b"marker"); // a used --backup-dir
     common::file(tmp.path(), "trash/old/data.txt", b"moved-aside content");
 
-    let out = filesync::scan::scan_with_errors(tmp.path(), &mut filesync::progress::ScanProgress::hidden());
+    let out = filesync::scan::scan_with_errors(tmp.path(), &mut filesync::progress_update::ScanProgress::hidden());
     let r = rels(&out.manifest);
     assert!(r.iter().any(|p| p == "keep.txt"));
     assert!(

@@ -1,6 +1,8 @@
-//! Live progress on stderr for long syncs. Purely cosmetic: indicatif hides itself when stderr
-//! isn't a terminal (cron, pipes), and the `hidden()` constructors are no-op handles for tests —
-//! the recorded results never depend on any of this.
+//! Live progress **updates** on stderr for long runs — updates, not reports: nothing here is ever
+//! written to a file (everything a run *reports* lives in [`crate::reports`]). Purely cosmetic:
+//! indicatif hides itself when stderr isn't a terminal (cron, pipes — where plain heartbeat lines
+//! take over), and the `hidden()` constructors are no-op handles for tests — the recorded results
+//! never depend on any of this.
 //!
 //! Two facilities: [`Progress`] for the apply/verify phases (totals are known → a real bar), and
 //! [`ScanProgress`] for scans — which can't know their total in advance (discovering the total IS
@@ -12,6 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+
+use crate::units::{human_bytes, human_elapsed};
 
 pub struct Progress {
     bar: Option<ProgressBar>,
@@ -284,50 +288,9 @@ impl CompareProgress {
     }
 }
 
-fn human_bytes(b: u64) -> String {
-    const KIB: u64 = 1 << 10;
-    const MIB: u64 = 1 << 20;
-    const GIB: u64 = 1 << 30;
-    if b >= GIB {
-        format!("{:.1} GiB", b as f64 / GIB as f64)
-    } else if b >= MIB {
-        format!("{:.1} MiB", b as f64 / MIB as f64)
-    } else if b >= KIB {
-        format!("{:.0} KiB", b as f64 / KIB as f64)
-    } else {
-        format!("{b} bytes")
-    }
-}
-
-fn human_elapsed(d: Duration) -> String {
-    let s = d.as_secs();
-    if s >= 3600 {
-        format!("{}h{}m", s / 3600, (s % 3600) / 60)
-    } else if s >= 60 {
-        format!("{}m{}s", s / 60, s % 60)
-    } else {
-        format!("{s}s")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bytes_are_humanized() {
-        assert_eq!(human_bytes(512), "512 bytes");
-        assert_eq!(human_bytes(8 << 10), "8 KiB");
-        assert_eq!(human_bytes(5 << 20), "5.0 MiB");
-        assert_eq!(human_bytes(3 << 30), "3.0 GiB");
-    }
-
-    #[test]
-    fn elapsed_is_humanized() {
-        assert_eq!(human_elapsed(Duration::from_secs(45)), "45s");
-        assert_eq!(human_elapsed(Duration::from_secs(125)), "2m5s");
-        assert_eq!(human_elapsed(Duration::from_secs(3700)), "1h1m");
-    }
 
     #[test]
     fn hidden_scan_progress_is_a_quiet_counter() {

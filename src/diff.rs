@@ -17,7 +17,8 @@ use std::time::{Duration, SystemTime};
 use crate::hash;
 use crate::links;
 use crate::manifest::{DstRoot, Entry, Kind, Manifest, SrcRoot};
-use crate::progress::CompareProgress;
+use crate::progress_update::CompareProgress;
+use crate::runtime::elevation;
 
 /// A single-path difference, carrying the entry kind so the planner knows how to realize it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,7 +331,7 @@ fn compare_entries(
                 // (see Diff::source_unreadable). Check it first so it wins if both sides fail.
                 (Err(e), _) => {
                     *source_unreadable = true;
-                    if crate::elevation::is_permission(&e) {
+                    if elevation::is_permission(&e) {
                         denied_source.push(se.rel.clone());
                     }
                     issues.push(format!(
@@ -340,7 +341,7 @@ fn compare_entries(
                     Verdict::Changed
                 }
                 (_, Err(e)) => {
-                    if crate::elevation::is_permission(&e) {
+                    if elevation::is_permission(&e) {
                         denied_dest.push(de.rel.clone());
                     }
                     issues.push(format!(
@@ -474,7 +475,7 @@ fn hash_candidates(
                 if matches!(side, Side::Source) {
                     source_unreadable = true;
                 }
-                if crate::elevation::is_permission(&e) {
+                if elevation::is_permission(&e) {
                     denied.push(files[i].rel.clone());
                 }
                 issues.push(format!(
@@ -500,60 +501,7 @@ impl Diff {
         self.changed.iter().map(|c| c.rel.clone()).collect()
     }
 
-    /// A git-diff-like textual summary. `detail` controls whether the per-file lines are included:
-    /// the findings file gets the full listing (`true`); the terminal gets only the count lines
-    /// (`false`), so a diff of a huge tree never floods the screen — the detail is in the file.
-    pub fn render(&self, detail: bool) -> String {
-        use std::fmt::Write;
-        let mut s = String::new();
-        let _ = writeln!(s, "moved:     {}", self.moved.len());
-        if detail {
-            for m in &self.moved {
-                let _ = writeln!(s, "    ~ {}  ->  {}", m.from.display(), m.to.display());
-            }
-        }
-        let _ = writeln!(s, "to copy:   {}", self.added.len());
-        if detail {
-            for c in &self.added {
-                if c.kind == Kind::Other {
-                    let _ = writeln!(s, "    + {} (special file — no content; will be skipped)", c.rel.display());
-                } else {
-                    let _ = writeln!(s, "    + {}", c.rel.display());
-                }
-            }
-        }
-        let _ = writeln!(s, "to delete: {}", self.removed.len());
-        if detail {
-            for c in &self.removed {
-                let _ = writeln!(s, "    - {}", c.rel.display());
-            }
-        }
-        let _ = writeln!(s, "to update: {}", self.changed.len());
-        if detail {
-            for c in &self.changed {
-                let _ = writeln!(s, "    * {}", c.rel.display());
-            }
-        }
-        let _ = writeln!(s, "to link:   {} (hard links — content written once via the leader)", self.to_link.len());
-        if detail {
-            for l in &self.to_link {
-                let _ = writeln!(s, "    & {}  ->  {}", l.name.display(), l.leader.display());
-            }
-        }
-        let _ = writeln!(s, "to refresh (content identical, metadata drift): {}", self.touched.len());
-        if detail {
-            for c in &self.touched {
-                let _ = writeln!(s, "    ≈ {}", c.rel.display());
-            }
-        }
-        let _ = writeln!(s, "unchanged: {}", self.unchanged);
-        if detail {
-            // Only ever populated under --include-same; listed here so the exhaustive findings
-            // account for every entry, not just the ones that change.
-            for rel in &self.unchanged_paths {
-                let _ = writeln!(s, "    = {}", rel.display());
-            }
-        }
-        s
-    }
+    // `Diff::render` (the findings/terminal presentation) is still a method on this type, but its
+    // impl lives with the other presentation code in `crate::reports::findings` — this module is
+    // analysis only.
 }

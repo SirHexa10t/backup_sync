@@ -10,13 +10,20 @@
 //! | `….conclusions.txt`   | [`conclusions`]   | diff             | one-shot (analysis + render) |
 //! | `….showstoppers.txt`  | [`showstoppers`]  | both, if any     | one-shot (analysis + render) |
 //!
-//! Live terminal progress is deliberately *not* here (`crate::progress`): it is ephemeral and never
-//! lands in a file — keeping it out of `reports/` is the point of the split.
+//! The per-command modules own everything each command *reports* — including its terminal summary
+//! (the compact counts, file pointers, issue surfacing, hints): [`diff_cmd`] writes the diff's
+//! files and prints its summary; [`sync_cmd`] adds sync's showstoppers forecast and end-of-run
+//! summary around the streamed [`Report`].
+//!
+//! Live terminal progress is deliberately *not* here (`crate::progress_update`): those are updates, not
+//! reports — ephemeral, never landing in a file. That boundary is the point of the split.
 
 pub mod conclusions;
+pub(crate) mod diff_cmd;
 pub mod errors;
 pub mod findings;
 pub mod showstoppers;
+pub(crate) mod sync_cmd;
 
 pub use findings::Report;
 

@@ -28,7 +28,7 @@ pub struct Report {
     /// Things deliberately not done because there is nothing to do (special files have no
     /// copyable content). Listed for transparency; they do NOT affect the exit code.
     pub skipped: Vec<String>,
-    /// Operations that needed root to get past a permission wall (see [`crate::elevation`]) —
+    /// Operations that needed root to get past a permission wall (see [`crate::runtime::elevation`]) —
     /// the accountability trail for a sudo-launched run. Not issues; no effect on the exit code.
     pub root_assisted: Vec<String>,
     /// When present, the report (header, skips, final counts) is streamed here as it's recorded.
@@ -206,6 +206,68 @@ pub(crate) fn write_diff(
         audit_block(audit)
     );
     super::write_diag(path, &content, "findings")
+}
+
+/// The presentation of a classified diff — a method on [`crate::diff::Diff`] whose impl lives here
+/// with the rest of the findings rendering (the analysis module stays presentation-free).
+impl crate::diff::Diff {
+    /// A git-diff-like textual summary. `detail` controls whether the per-file lines are included:
+    /// the findings file gets the full listing (`true`); the terminal gets only the count lines
+    /// (`false`), so a diff of a huge tree never floods the screen — the detail is in the file.
+    pub fn render(&self, detail: bool) -> String {
+        use crate::manifest::Kind;
+        use std::fmt::Write;
+        let mut s = String::new();
+        let _ = writeln!(s, "moved:     {}", self.moved.len());
+        if detail {
+            for m in &self.moved {
+                let _ = writeln!(s, "    ~ {}  ->  {}", m.from.display(), m.to.display());
+            }
+        }
+        let _ = writeln!(s, "to copy:   {}", self.added.len());
+        if detail {
+            for c in &self.added {
+                if c.kind == Kind::Other {
+                    let _ = writeln!(s, "    + {} (special file — no content; will be skipped)", c.rel.display());
+                } else {
+                    let _ = writeln!(s, "    + {}", c.rel.display());
+                }
+            }
+        }
+        let _ = writeln!(s, "to delete: {}", self.removed.len());
+        if detail {
+            for c in &self.removed {
+                let _ = writeln!(s, "    - {}", c.rel.display());
+            }
+        }
+        let _ = writeln!(s, "to update: {}", self.changed.len());
+        if detail {
+            for c in &self.changed {
+                let _ = writeln!(s, "    * {}", c.rel.display());
+            }
+        }
+        let _ = writeln!(s, "to link:   {} (hard links — content written once via the leader)", self.to_link.len());
+        if detail {
+            for l in &self.to_link {
+                let _ = writeln!(s, "    & {}  ->  {}", l.name.display(), l.leader.display());
+            }
+        }
+        let _ = writeln!(s, "to refresh (content identical, metadata drift): {}", self.touched.len());
+        if detail {
+            for c in &self.touched {
+                let _ = writeln!(s, "    ≈ {}", c.rel.display());
+            }
+        }
+        let _ = writeln!(s, "unchanged: {}", self.unchanged);
+        if detail {
+            // Only ever populated under --include-same; listed here so the exhaustive findings
+            // account for every entry, not just the ones that change.
+            for rel in &self.unchanged_paths {
+                let _ = writeln!(s, "    = {}", rel.display());
+            }
+        }
+        s
+    }
 }
 
 /// The root-assist audit as a text block (empty when there were no assists) — appended to diff's

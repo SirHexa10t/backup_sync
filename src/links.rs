@@ -34,7 +34,7 @@ pub fn desired_target(
         let parent = link_rel.parent().unwrap_or_else(|| Path::new(""));
         src.path().join(parent).join(raw_target)
     };
-    let resolved = crate::canonicalize_lenient(&abs);
+    let resolved = crate::preflight::canonicalize_lenient(&abs);
     let Ok(src_root) = fs::canonicalize(src.path()) else {
         return raw_target.to_path_buf(); // can't resolve the source root — don't rewrite
     };

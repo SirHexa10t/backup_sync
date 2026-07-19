@@ -13,8 +13,7 @@ use std::path::PathBuf;
 
 use crate::manifest::DstRoot;
 
-/// The lockfile's name, at the destination root. Scans exclude it (it's filesync's own artifact).
-pub const LOCK_FILE: &str = ".filesync.lock";
+use crate::artifacts::LOCK_FILE;
 
 /// A held lock — released (deleted) on drop, including early returns.
 pub struct Lock {

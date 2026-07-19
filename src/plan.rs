@@ -14,7 +14,7 @@
 //!   4. **CreateDir** for new directories (parents before children).
 //!   5. **Copy** the new/changed files — the space-consuming writes, last.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::diff::Diff;
 use crate::manifest::Kind;
@@ -98,4 +98,46 @@ pub fn plan(diff: &Diff) -> Vec<Action> {
     );
 
     actions
+}
+
+/// Total bytes the planned `Copy` actions will write (source sizes; symlinks count as 0) — for
+/// the progress bar's length and the suspended-deletions space look-ahead.
+pub(crate) fn planned_copy_bytes(actions: &[Action], src_m: &crate::manifest::Manifest) -> u64 {
+    let sizes: std::collections::HashMap<&Path, u64> =
+        src_m.iter().map(|e| (e.rel.as_path(), e.size)).collect();
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::Copy(rel) => sizes.get(rel.as_path()).copied(),
+            _ => None,
+        })
+        .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::{Entry, Manifest};
+
+    #[test]
+    fn planned_copy_bytes_sums_only_copy_actions() {
+        let entry = |rel: &str, size: u64| Entry {
+            rel: PathBuf::from(rel),
+            kind: Kind::File,
+            size,
+            mtime: None,
+            link_target: None,
+            link_id: None,
+            owner: None,
+            mode: None,
+        };
+        let m = Manifest::from_sorted(vec![entry("a", 100), entry("b", 7)]);
+        let actions = vec![
+            Action::Copy(PathBuf::from("a")),
+            Action::Delete(PathBuf::from("x")),
+            Action::Copy(PathBuf::from("b")),
+            Action::Copy(PathBuf::from("not-in-manifest")),
+        ];
+        assert_eq!(planned_copy_bytes(&actions, &m), 107);
+    }
 }

@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::manifest::{DstRoot, Entry, Kind, Manifest};
-use crate::progress::ScanProgress;
+use crate::progress_update::ScanProgress;
+use crate::runtime::elevation;
 
 /// Everything a scan learned: the manifest, plus what it could NOT include — read errors and
-/// backup dirs it deliberately skipped (directories carrying [`crate::apply::BACKUP_MARKER`]).
+/// backup dirs it deliberately skipped (directories carrying [`crate::artifacts::BACKUP_MARKER`]).
 pub struct ScanOutcome {
     pub manifest: Manifest,
     /// Human-readable messages for entries that couldn't be read (permission-denied dirs etc.).
@@ -30,7 +31,7 @@ pub fn scan(root: &Path) -> Manifest {
 
 /// Like [`scan`], but also reports what was left out: read errors (so a run can surface them
 /// instead of silently omitting content) and skipped backup dirs (directories containing the
-/// [`crate::apply::BACKUP_MARKER`] file — filesync's own move-aside storage, which must never be
+/// [`crate::artifacts::BACKUP_MARKER`] file — filesync's own move-aside storage, which must never be
 /// mirrored, deleted, or re-backed-up). Readable, unmarked entries are collected either way.
 /// Never modifies the tree — safe for the (read-only) source.
 pub fn scan_with_errors(root: &Path, progress: &mut ScanProgress) -> ScanOutcome {
@@ -59,7 +60,7 @@ fn walk(root: &Path, sweep_tmp: bool, progress: &mut ScanProgress) -> (ScanOutco
     let filtered = walker.filter_entry(|dent| {
         let marked = dent.depth() >= 1
             && dent.file_type().is_dir()
-            && dent.path().join(crate::apply::BACKUP_MARKER).exists();
+            && dent.path().join(crate::artifacts::BACKUP_MARKER).exists();
         if marked {
             let rel = dent.path().strip_prefix(root).unwrap_or(dent.path()).to_path_buf();
             skipped_backup_dirs.push(rel);
@@ -71,14 +72,14 @@ fn walk(root: &Path, sweep_tmp: bool, progress: &mut ScanProgress) -> (ScanOutco
         match result {
             // our own atomic-copy temp files are scratch, not content: skip (and sweep at dst)
             Ok(dent)
-                if dent.file_name().to_string_lossy().starts_with(crate::apply::TMP_PREFIX) =>
+                if dent.file_name().to_string_lossy().starts_with(crate::artifacts::TMP_PREFIX) =>
             {
                 if sweep_tmp && dent.file_type().is_file() {
                     // a stray left by an interrupted ELEVATED run can be root-owned in a
                     // root-owned dir — the same wall-retry applies to sweeping it
                     let p = dent.path();
                     let first = fs::remove_file(p);
-                    if crate::elevation::retry_if_permission("sweep temp file", p, first, || {
+                    if elevation::retry_if_permission("sweep temp file", p, first, || {
                         fs::remove_file(p)
                     })
                     .is_ok()
@@ -89,7 +90,7 @@ fn walk(root: &Path, sweep_tmp: bool, progress: &mut ScanProgress) -> (ScanOutco
                 progress.tick(0);
             }
             // the root-level lockfile is the running sync's own artifact, never content
-            Ok(dent) if dent.depth() == 1 && dent.file_name() == crate::lock::LOCK_FILE => {
+            Ok(dent) if dent.depth() == 1 && dent.file_name() == crate::artifacts::LOCK_FILE => {
                 progress.tick(0);
             }
             Ok(dent) => {
@@ -101,8 +102,8 @@ fn walk(root: &Path, sweep_tmp: bool, progress: &mut ScanProgress) -> (ScanOutco
             // heals the biggest failure mode outright — a healed source scan is complete, so
             // deletion suspension doesn't trigger at all.
             Err(e)
-                if crate::elevation::available()
-                    && e.io_error().is_some_and(crate::elevation::is_permission)
+                if elevation::available()
+                    && e.io_error().is_some_and(elevation::is_permission)
                     && e.path().is_some_and(|p| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())) =>
             {
                 let dir = e.path().expect("guarded above").to_path_buf();
@@ -116,7 +117,7 @@ fn walk(root: &Path, sweep_tmp: bool, progress: &mut ScanProgress) -> (ScanOutco
             }
             Err(e) => {
                 errors.push(describe_walk_error(root, &e));
-                if e.io_error().is_some_and(crate::elevation::is_permission) {
+                if e.io_error().is_some_and(elevation::is_permission) {
                     push_denied(&mut denied, root, &e);
                 }
             }
@@ -149,17 +150,17 @@ fn scan_subtree_elevated(
     swept: &mut usize,
     progress: &mut ScanProgress,
 ) -> bool {
-    let Ok(_guard) = crate::elevation::ThreadRoot::acquire() else { return false };
+    let Ok(_guard) = elevation::ThreadRoot::acquire() else { return false };
     let mut found = 0usize;
     let walker = WalkDir::new(dir_abs).follow_links(false).min_depth(1).into_iter();
     // same pruning as the main walk: marked backup dirs are never scanned
     let filtered = walker.filter_entry(|dent| {
-        !(dent.file_type().is_dir() && dent.path().join(crate::apply::BACKUP_MARKER).exists())
+        !(dent.file_type().is_dir() && dent.path().join(crate::artifacts::BACKUP_MARKER).exists())
     });
     for result in filtered {
         match result {
             Ok(dent)
-                if dent.file_name().to_string_lossy().starts_with(crate::apply::TMP_PREFIX) =>
+                if dent.file_name().to_string_lossy().starts_with(crate::artifacts::TMP_PREFIX) =>
             {
                 if sweep_tmp && dent.file_type().is_file() && fs::remove_file(dent.path()).is_ok()
                 {
@@ -176,7 +177,7 @@ fn scan_subtree_elevated(
             Err(e) => errors.push(describe_walk_error(root, &e)),
         }
     }
-    crate::elevation::record(format!(
+    elevation::record(format!(
         "read directory (elevated): {} — {found} entr{} merged into the scan",
         dir_abs.display(),
         if found == 1 { "y" } else { "ies" }

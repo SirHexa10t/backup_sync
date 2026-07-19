@@ -4,12 +4,13 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use crate::runtime::elevation;
 
 /// blake3 hash of a file's contents. A permission wall (EACCES/EPERM) is retried with root when
-/// it's in reserve (see [`crate::elevation`]) — reading changes nothing about the file.
+/// it's in reserve (see [`crate::runtime::elevation`]) — reading changes nothing about the file.
 pub fn hash_file(path: &Path) -> std::io::Result<blake3::Hash> {
     let first = hash_once(path);
-    crate::elevation::retry_if_permission("read for hashing", path, first, || hash_once(path))
+    elevation::retry_if_permission("read for hashing", path, first, || hash_once(path))
 }
 
 fn hash_once(path: &Path) -> std::io::Result<blake3::Hash> {

@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use filesync::diff::{diff, Diff, DiffOptions, Move};
 use filesync::manifest::{DstRoot, SrcRoot};
-use filesync::progress::CompareProgress;
+use filesync::progress_update::CompareProgress;
 use filesync::scan::scan;
 
 fn run_diff(src: &Path, dst: &Path, eager: bool) -> Diff {

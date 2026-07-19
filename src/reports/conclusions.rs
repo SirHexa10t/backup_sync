@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use crate::diff::Diff;
 use crate::manifest::{Kind, Manifest};
+use crate::units::{human_bytes, signed_bytes};
 
 /// Path components that are pure noise — tallied separately so backing up someone's trash, or a
 /// recycle folder about to be mirror-deleted, doesn't hide inside the totals. `.Trash-*` is matched
@@ -518,24 +519,6 @@ fn percent(part: u64, whole: u64) -> u64 {
     } else {
         (part.saturating_mul(100)) / whole
     }
-}
-
-fn human_bytes(n: u64) -> String {
-    const U: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-    if n < 1024 {
-        return format!("{n} B");
-    }
-    let (mut v, mut i) = (n as f64, 0usize);
-    while v >= 1024.0 && i < U.len() - 1 {
-        v /= 1024.0;
-        i += 1;
-    }
-    format!("{v:.1} {}", U[i])
-}
-
-fn signed_bytes(n: i64) -> String {
-    let sign = if n < 0 { "-" } else { "+" };
-    format!("{sign}{}", human_bytes(n.unsigned_abs()))
 }
 
 fn truncate(s: &str, max: usize) -> String {
