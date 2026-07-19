@@ -60,11 +60,12 @@ pub struct Common {
     #[arg(long)]
     pub relative_symlinks: bool,
 
-    /// Never use root, even when launched under sudo (privileges are dropped permanently at
-    /// startup). Without this flag, a sudo-launched filesync still runs as your user but holds
-    /// root in reserve to get past permission walls (unreadable/undeletable files) at known
-    /// operations only; every use is recorded in the report, and existing files' ownership and
-    /// permissions are never modified.
+    /// Run without root. Without this flag, an interactive run launched unprivileged asks for
+    /// sudo right at the start (never mid-run), and a sudo-launched filesync runs as your user
+    /// holding root in reserve — used only to get past permission walls (unreadable/undeletable
+    /// files) at known operations, with every use recorded in the report and existing files'
+    /// ownership/permissions never modified. With this flag: no prompt, no root use (privileges
+    /// are dropped permanently even under sudo), restricted files are reported instead of handled.
     #[arg(long)]
     pub unelevated: bool,
 }

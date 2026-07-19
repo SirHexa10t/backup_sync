@@ -69,6 +69,11 @@ fn walk(root: &Path, sweep_tmp: bool, progress: &mut ScanProgress) -> (ScanOutco
     });
 
     for result in filtered {
+        // Graceful stop: a scan of a big drive takes minutes — bail out promptly. The caller
+        // checks the same flag and refuses to act on a truncated manifest.
+        if crate::runtime::interrupt::requested() {
+            break;
+        }
         match result {
             // our own atomic-copy temp files are scratch, not content: skip (and sweep at dst)
             Ok(dent)
@@ -158,6 +163,9 @@ fn scan_subtree_elevated(
         !(dent.file_type().is_dir() && dent.path().join(crate::artifacts::BACKUP_MARKER).exists())
     });
     for result in filtered {
+        if crate::runtime::interrupt::requested() {
+            break; // same graceful-stop bail as the main walk
+        }
         match result {
             Ok(dent)
                 if dent.file_name().to_string_lossy().starts_with(crate::artifacts::TMP_PREFIX) =>

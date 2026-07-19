@@ -152,6 +152,12 @@ place on the Destination**: no transfer, no write, no flash wear. Steps 1–4 ar
 3. **Cross-reference `add` × `extra` by content:**
    - group `extra` files by **size** — a cheap pre-filter, since only equal-size files can be
      identical, so we hash *only genuine candidates, never the whole tree*;
+   - **size 0 is excluded outright**: every empty file "matches" every other empty file, so any
+     pairing would be arbitrary rather than a detected relocation — and real trees hold *many*
+     empty files (package markers, lock/placeholder files), each of which would cost a pointless
+     `open()` on both drives just to confirm the trivial. Empty adds/extras stay plain
+     copies/deletes (an empty copy is as cheap as a rename anyway), and the `conclusions` file
+     notes when both sides had empties, so the absence of "moves" between them is explained;
    - for each `add` with a same-size `extra`, blake3-hash both. Computing the hash reads every byte,
      so a match is a true content check (collision odds ~2⁻²⁵⁶), not a name check;
    - match → **move**: plan `rename(dest/old → dest/new)` and drop the pair from `add`/`extra`;

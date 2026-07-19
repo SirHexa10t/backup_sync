@@ -49,7 +49,7 @@ pub fn arm() {}
 extern "C" fn on_signal(_sig: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
     const MSG: &[u8] =
-        b"\nfilesync: stopping after the current file finishes... (signal again to abort now)\n";
+        b"\nfilesync: stopping cleanly - finishing the current step... (signal again to abort immediately)\n";
     unsafe {
         let _ = libc::write(2, MSG.as_ptr() as *const libc::c_void, MSG.len() as libc::size_t);
         // Restore the default disposition so a SECOND signal aborts the process immediately.

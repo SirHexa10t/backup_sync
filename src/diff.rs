@@ -136,6 +136,11 @@ pub fn diff(
         groups.iter().flat_map(|g| g[1..].iter().map(|e| e.rel.as_path())).collect();
 
     for se in src_m.iter() {
+        // Graceful stop: eager/mtime-drift comparisons hash real bytes, so this loop can run long.
+        // The caller (run_sync) checks the same flag and never acts on a truncated classification.
+        if crate::runtime::interrupt::requested() {
+            break;
+        }
         // A follower's content is its leader's business. Here we only make sure a wrong-kind
         // occupant at the follower's destination path gets cleared; whether a link is needed is
         // decided by the linkage pass.
@@ -469,6 +474,9 @@ fn hash_candidates(
     let mut denied = Vec::new();
     let mut source_unreadable = false;
     for i in cand {
+        if crate::runtime::interrupt::requested() {
+            break; // graceful stop mid-hashing — the caller discards truncated results
+        }
         match hash::hash_file(&root.join(&files[i].rel)) {
             Ok(h) => out.push((i, *h.as_bytes())),
             Err(e) => {

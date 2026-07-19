@@ -73,7 +73,7 @@ filesync sync --from ~/Documents --to /mnt/backup --backup-dir /mnt/backup/.tras
 | `--eager-checksum` | both | off | Compare by file **content** (blake3) instead of size+mtime. For a thorough check, or to never miss a same-size+same-mtime change. **Re-running with this flag after a completed backup is how you hunt corruption**: a verified mirror that now differs where size and mtime still match means bytes rotted on one side — filesync calls that signature out in the report and re-copies from the source (pair with `--backup-dir` so the destination's old version survives, in case the *source* was the rotten side). |
 | `--report <DIR>` | both | current dir | Existing directory to write this run's output files into (see [The report](#the-report)). Must be outside both trees. |
 | `--include-same` | `diff` | off | Also list content-identical files (needing neither copy nor move) in the findings. Off by default — the list can be enormous. |
-| `--unelevated` | both | root **used** when launched under sudo | Never use root, even under sudo — privileges are dropped permanently at startup, and restricted-access files are reported instead of handled. See [Restricted-access files](#restricted-access-files-running-under-sudo). |
+| `--unelevated` | both | interactive runs **prompt for sudo** at start | Run without root: no sudo prompt, no startup notice, and no root use even when launched under sudo (privileges are dropped permanently) — restricted-access files are reported instead of handled. See [Restricted-access files](#restricted-access-files-running-under-sudo). |
 | `--no-verify` | `sync` | verify **on** | Skip re-reading each copied file to confirm it landed correctly. |
 | `--fsync-each` | `sync` | off | Force every file to disk individually (durable-as-you-go, but ~2–17× slower). Default is one flush at the end. |
 | `--backup-dir <DIR>` | `sync` | — | Move files that would be deleted or overwritten here, instead of erasing them. Must be a **fresh** dir (absent or empty) on the **destination's filesystem**, not inside the source — one backup dir per run. It may live inside the destination: filesync marks it with a `.filesync-backup-dir` file, and never mirrors, deletes, or re-backs-up a marked dir. |
@@ -180,15 +180,20 @@ destructive fixes are a conscious act. Quoting is bash-exact (ANSI-C `$'…'` wh
 filenames containing newlines round-trip byte-perfect. Running [under sudo](#restricted-access-files-running-under-sudo)
 makes most of these disappear — the file then lists only what root couldn't or wasn't allowed to fix.
 
-A `sync` can take a long time. To stop one **gracefully** — without abandoning it mid-write — signal it:
+## Stopping a run early
+
+Both commands can run for hours. To stop a run **gracefully** — without abandoning it mid-write — signal it:
 
 - **`Ctrl+C`** (interactive), or **`kill <pid>`** (from another terminal / a script; the PID is in
   the destination's `.filesync.lock`).
 
-(A one-line reminder of this appears above the progress bar when the copy phase starts.) On the
-first signal filesync **finishes the file it's currently writing, then stops before the next one**
-— it doesn't start any further copies, renames, or deletes. It still runs the finalize over what it
-did: the durability flush and the verify pass, and a report that ends with
+(A one-line reminder of this is printed at the very start of the run, above all progress output.)
+The clean stop works in **every phase of both commands**: during the scans or the compare phase
+(which can take minutes on a big drive — a `diff` consists of nothing else), filesync winds down
+within moments and reports that nothing was changed and no report files were written, exiting
+non-zero; during sync's copy phase, it **finishes the file it's currently writing, then stops
+before the next one** — no further copies, renames, or deletes — and still runs
+the finalize over what it did: the durability flush and the verify pass, and a report that ends with
 `run stopped early by request — N of M planned action(s) done`. The output files written so far are
 **renamed with an `-interrupted` marker** (`…-interrupted.findings.txt`), so a partial record is
 never mistaken for a complete one, and the summary lists exactly which files record the partial run
@@ -209,6 +214,12 @@ To let it handle them unattended, launch it under sudo:
 ```
 sudo filesync sync --from /data --to /mnt/backup
 ```
+
+You don't have to remember to: an **interactive** run launched without root explains this and asks
+for sudo **right at the start** (never mid-run — the prompt happens before any work, while you're
+still at the keyboard), then re-runs itself elevated. `--unelevated` is the explicit opt-out: pass
+it to run without root, prompt-free. Unattended runs (no terminal — cron, pipes) can't be prompted;
+they proceed unprivileged and leave a one-line notice, which `--unelevated` likewise silences.
 
 This does **not** run the backup as root. At startup filesync **drops to your user** and does all
 normal work unprivileged; root is held in reserve and used only to retry an operation that hit a

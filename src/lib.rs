@@ -64,6 +64,11 @@ pub fn run(cli: Cli) -> u8 {
                 }
             };
 
+            // A diff is read-only, but it can run for hours — give it the same clean stop as
+            // sync: Ctrl+C winds down the scans/compare within moments instead of hard-killing.
+            runtime::interrupt::arm();
+            progress_update::print_stop_hint();
+
             // Scan both trees. On different devices, do it concurrently — the two reads use
             // independent I/O paths and the CPU isn't the bottleneck; on one device, sequentially
             // (parallel reads would only fight over the head).
@@ -91,6 +96,12 @@ pub fn run(cli: Cli) -> u8 {
                 (so, d_out)
             };
 
+            // A stop during the scans: the manifests are truncated — report nothing from them.
+            if runtime::interrupt::requested() {
+                println!("stopped early — nothing was changed and no report files were written");
+                return 1;
+            }
+
             let dopts = diff::DiffOptions {
                 eager: a.common.eager_checksum,
                 relative_symlinks: a.common.relative_symlinks,
@@ -101,8 +112,15 @@ pub fn run(cli: Cli) -> u8 {
             let d = diff::diff(&src, &src_scan.manifest, &dst, &dst_scan.manifest, &dopts, &cp);
             cp.finish();
 
+            // A stop during the compare phase: the classification is truncated — same refusal.
+            if runtime::interrupt::requested() {
+                println!("stopped early — nothing was changed and no report files were written");
+                return 1;
+            }
+
             // All reporting — the four output files AND the terminal summary — is reports/'
-            // business (crate::reports::diff_cmd). A diff is a preview; it always exits 0.
+            // business (crate::reports::diff_cmd). A completed diff is a preview; it exits 0
+            // (a STOPPED one exited 1 above — its view was incomplete).
             let audit = runtime::elevation::drain_audit();
             reports::diff_cmd::emit(
                 &out_dir,
@@ -165,6 +183,12 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> u8 {
         }
     }
 
+    // Arm the graceful stop for the WHOLE run — the scans and the compare phase check the flag
+    // too, so Ctrl+C during a minutes-long scan winds down cleanly instead of hard-killing. Tell
+    // the user so, up front, above all status updates.
+    runtime::interrupt::arm();
+    progress_update::print_stop_hint();
+
     // Scan both trees — concurrently when they're on different devices (independent I/O paths),
     // sequentially on one device. The destination scan also sweeps temp files a previous,
     // interrupted run left behind.
@@ -190,6 +214,12 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> u8 {
         dp.finish();
         (so, dr)
     };
+    // A stop during the scans: nothing was changed and nothing was written — say exactly that.
+    // (The manifests are truncated, so no later stage may act on them.)
+    if runtime::interrupt::requested() {
+        println!("stopped early — nothing was changed and no report files were written");
+        return 1;
+    }
     if src_scan.manifest.is_empty() {
         eprintln!(
             "filesync sync: source {} is empty — refusing to mirror, which would delete everything \
@@ -217,6 +247,13 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> u8 {
     let cp = progress_update::CompareProgress::start();
     let d = diff::diff(src, &src_m, dst, &dst_m, &dopts, &cp);
     cp.finish();
+
+    // A stop during the compare phase: the classification is truncated — refuse to act on it.
+    // Still before any file was created or touched.
+    if runtime::interrupt::requested() {
+        println!("stopped early — nothing was changed and no report files were written");
+        return 1;
+    }
 
     let opts = apply::Options {
         verify: !a.no_verify,
@@ -366,10 +403,8 @@ fn run_sync(src: &SrcRoot, dst: &DstRoot, a: &cli::SyncArgs) -> u8 {
         ));
     }
 
-    // Arm the graceful-stop handlers just before the mutating phase: the first Ctrl+C (or a
-    // SIGTERM) stops after the current file and finalizes cleanly; a second aborts. The scanning
-    // above is read-only, so a stop there is just a plain (safe) abort — nothing to finalize.
-    runtime::interrupt::arm();
+    // (The graceful-stop handlers were armed at the start of the run — a stop from here on lands
+    // in apply's between-actions check and finalizes cleanly.)
 
     // Live progress for the long parts (bar = bytes to copy; auto-hidden off-terminal).
     let prog = progress_update::Progress::for_sync(plan::planned_copy_bytes(&actions, &src_m), actions.len() as u64);

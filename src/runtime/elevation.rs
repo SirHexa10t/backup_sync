@@ -65,6 +65,17 @@ mod imp {
         let euid = unsafe { libc::geteuid() };
         if euid != 0 {
             let _ = RESERVE.set(None);
+            // Say so up front — not at the end, when the walls have already been hit. The
+            // `--unelevated` flag is the deliberate "I know, run without root" acknowledgement
+            // (and the way to silence this notice for unattended unprivileged runs).
+            if !unelevated {
+                eprintln!(
+                    "filesync: running without root — files your user can't read or delete will \
+                     be reported (see the showstoppers file), not handled. Run as `sudo filesync \
+                     …` to let it handle them (root is used only at permission walls, audited), \
+                     or pass --unelevated to run unprivileged without this notice."
+                );
+            }
             return Ok(());
         }
 
@@ -110,6 +121,60 @@ mod imp {
             let _ = RESERVE.set(Some(Reserve { uid, gid }));
         }
         Ok(())
+    }
+
+    /// Interactive launch without root (and without `--unelevated`): explain, then re-run
+    /// ourselves under sudo — so the password prompt appears RIGHT AT THE START, never mid-run.
+    /// This is what gives `--unelevated` its meaning: it is the explicit "run without root"
+    /// choice, not just a notice-silencer. Exits with the elevated run's code; returns only when
+    /// no prompt applies (already root, `--unelevated`, or no terminal to prompt on — cron/pipes
+    /// continue unprivileged, with [`init`]'s one-line notice). Called from `main` only — library
+    /// embedders and in-process tests never re-exec.
+    pub fn sudo_prompt_at_start(unelevated: bool) {
+        use std::io::IsTerminal;
+        if unelevated || unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+            return; // nowhere to prompt — init() prints the informational notice instead
+        }
+        eprintln!(
+            "filesync: root may be needed to handle restricted-access files — asking for sudo \
+             now (root is used only at permission walls, and every use is audited in the report). \
+             To run without root instead, pass --unelevated."
+        );
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "filesync: cannot locate my own executable to re-run under sudo ({e}) — run \
+                     as `sudo filesync …` yourself, or pass --unelevated to run without root"
+                );
+                std::process::exit(1);
+            }
+        };
+        // The elevated child owns the run (and the terminal); this wrapper only waits and mirrors
+        // the exit code. Ignore the stop signals here so Ctrl+C reaches the child's graceful-stop
+        // handling instead of killing the wrapper out from under it.
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_IGN);
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        }
+        match std::process::Command::new("sudo")
+            .arg("--")
+            .arg(exe)
+            .args(std::env::args_os().skip(1))
+            .status()
+        {
+            Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+            Err(e) => {
+                eprintln!(
+                    "filesync: could not invoke sudo ({e}) — run as `sudo filesync …` yourself, \
+                     or pass --unelevated to run without root"
+                );
+                std::process::exit(1);
+            }
+        }
     }
 
     /// Is this a permission wall (EACCES/EPERM) — the only class of error root may retry?
@@ -284,6 +349,9 @@ mod stub {
         }
     }
 
+    pub fn sudo_prompt_at_start(_unelevated: bool) {
+        // no sudo on this platform; runs proceed with whatever privileges they were given
+    }
     pub fn init(_unelevated: bool) -> Result<(), String> {
         Ok(()) // no unix privilege model here; elevation is simply unavailable
     }

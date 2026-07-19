@@ -487,16 +487,14 @@ fn graceful_stop_renames_reports_with_interrupted_marker() {
     let output = child.wait_with_output().expect("wait for filesync");
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    if !stdout.contains("stopped early") {
-        eprintln!("skipping: the signal landed outside the graceful window (run too fast/slow)");
+    // Two graceful outcomes exist: a stop during apply (files written → inventory) and a stop
+    // during scan/compare (nothing written). This test targets the apply-phase one; anything else
+    // means the signal landed outside its window — skip rather than flake.
+    if !stdout.contains("these files record the partial run") {
+        eprintln!("skipping: the signal landed outside the apply-phase window:\n{stdout}");
         return;
     }
     assert!(!output.status.success(), "an interrupted mirror must exit non-zero");
-    // the summary lists the partial-run files explicitly …
-    assert!(
-        stdout.contains("these files record the partial run"),
-        "explicit file inventory expected:\n{stdout}"
-    );
     assert!(stdout.contains("-interrupted"), "listed paths carry the marker:\n{stdout}");
     // … and on disk, the report carries the marker, the stop note, and the partial counts
     let renamed = find_output(out.path(), "-interrupted.findings.txt")
@@ -508,6 +506,95 @@ fn graceful_stop_renames_reports_with_interrupted_marker() {
         find_output(out.path(), "-interrupted.errors.txt").is_none(),
         "no issues → no errors file, interrupted or not"
     );
+}
+
+/// The DIFF command gets the same clean stop (it can run for hours): a signal during its scans
+/// winds down within moments, writes nothing, says so, and exits non-zero. Skip-guarded like its
+/// sync counterpart.
+#[cfg(unix)]
+#[test]
+fn diff_graceful_stop_during_scan_reports_nothing_written() {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    for d in 0..40 {
+        let dir = src.path().join(format!("d{d:02}"));
+        fs::create_dir(&dir).unwrap();
+        for i in 0..500 {
+            fs::write(dir.join(format!("f{i:03}")), b"x").unwrap();
+        }
+    }
+
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_filesync"))
+        .args(["diff", "--from"])
+        .arg(src.path())
+        .arg("--to")
+        .arg(dst.path())
+        .arg("--report")
+        .arg(out.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn filesync");
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    let _ = std::process::Command::new("kill").args(["-TERM", &child.id().to_string()]).status();
+    let output = child.wait_with_output().expect("wait for filesync");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    if !stdout.contains("nothing was changed and no report files were written") {
+        eprintln!("skipping: the signal landed outside the scan/compare window:\n{stdout}");
+        return;
+    }
+    assert!(!output.status.success(), "a stopped diff is incomplete — non-zero exit");
+    assert!(
+        find_output(out.path(), ".findings.txt").is_none(),
+        "no findings may exist after a stopped diff"
+    );
+}
+
+/// A stop landing in the SCAN phase (armed from the very start of the run now) must also wind down
+/// cleanly: nothing changed, nothing written, and the summary says exactly that. Uses a huge
+/// entry count so the scan window is wide; skips if the signal lands elsewhere.
+#[cfg(unix)]
+#[test]
+fn graceful_stop_during_scan_reports_nothing_written() {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    for d in 0..40 {
+        let dir = src.path().join(format!("d{d:02}"));
+        fs::create_dir(&dir).unwrap();
+        for i in 0..500 {
+            fs::write(dir.join(format!("f{i:03}")), b"x").unwrap();
+        }
+    }
+
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_filesync"))
+        .args(["sync", "--from"])
+        .arg(src.path())
+        .arg("--to")
+        .arg(dst.path())
+        .arg("--report")
+        .arg(out.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn filesync");
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    let _ = std::process::Command::new("kill").args(["-TERM", &child.id().to_string()]).status();
+    let output = child.wait_with_output().expect("wait for filesync");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    if !stdout.contains("nothing was changed and no report files were written") {
+        eprintln!("skipping: the signal landed outside the scan/compare window:\n{stdout}");
+        return;
+    }
+    assert!(!output.status.success(), "a stopped run must exit non-zero");
+    assert!(
+        find_output(out.path(), ".findings.txt").is_none(),
+        "no report files may exist after a scan-phase stop"
+    );
+    assert!(!dst.path().join("d00").exists(), "nothing was copied");
 }
 
 /// Audit finding #2b: the backup dir receives writes, so it must never be inside the read-only
@@ -614,6 +701,11 @@ fn diff_subprocess_streams_progress_and_writes_findings_and_errors_files() {
 
     let err = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // the no-root notice appears at the START of every unprivileged run (--unelevated silences it)
+    assert!(
+        err.contains("running without root") && err.contains("--unelevated"),
+        "the startup notice must offer sudo and the --unelevated acknowledgement:\n{err}"
+    );
     // progress streams to stderr (non-tty log mode) …
     assert!(
         err.contains("scanned") && err.contains("entries"),
