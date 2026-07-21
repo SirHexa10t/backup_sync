@@ -157,7 +157,9 @@ place on the Destination**: no transfer, no write, no flash wear. Steps 1–4 ar
      empty files (package markers, lock/placeholder files), each of which would cost a pointless
      `open()` on both drives just to confirm the trivial. Empty adds/extras stay plain
      copies/deletes (an empty copy is as cheap as a rename anyway), and the `conclusions` file
-     notes when both sides had empties, so the absence of "moves" between them is explained;
+     notes when both sides had empties, so the absence of "moves" between them is explained.
+     (Measured together with the parallel two-device scan/hash phase: `diff` on a real 8 TB pair
+     went 5h → 2.5h — see "scanning two devices at once" below);
    - for each `add` with a same-size `extra`, blake3-hash both. Computing the hash reads every byte,
      so a match is a true content check (collision odds ~2⁻²⁵⁶), not a name check;
    - match → **move**: plan `rename(dest/old → dest/new)` and drop the pair from `add`/`extra`;
@@ -341,6 +343,13 @@ dependency); same device → sequential, since parallel reads there would only t
 doesn't contradict the `--jobs` verdict — it's a distinct axis (two devices, not N workers on one).
 (Caveat: two partitions of one physical disk look "different" to the dev-id check; the real win is
 genuinely separate drives.)
+
+**Measured, real use-case:** on an 8 TB backup pair (internal disk ↔ external drive, ~1.4M
+entries), this change together with the empty-file exclusion from move-detection (see the size-0
+bullet in the algorithm above) **cut `diff`'s wall-clock in half: 5h → 2.5h**. The two changes
+landed between the same pair of runs, so the halving is their combined effect — unapportioned, but
+consistent with expectation: overlapping two independent drives approaches 2×, and dropping
+thousands of pointless empty-file opens compounds it.
 
 ### The fix: one fs-sync, not N per-file fsyncs
 

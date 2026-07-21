@@ -197,8 +197,8 @@ impl Report {
     }
 }
 
-/// `diff`'s one-shot findings file: header, the full classification, and the root-assist audit (if
-/// any). Returns whether the file was written.
+/// `diff`'s one-shot findings file: header, a marker legend, the full classification, and the
+/// root-assist audit (if any). Returns whether the file was written.
 pub(crate) fn write_diff(
     path: &Path,
     src_disp: &str,
@@ -206,8 +206,31 @@ pub(crate) fn write_diff(
     rendered_diff: &str,
     audit: &[String],
 ) -> bool {
+    // The header must NOT share the entries' `A -> B` syntax (it once primed a misreading of the
+    // moved lines), and the legend doubles as a table of contents: every MARKER_* keyword below
+    // also titles its section in the body, so it can be searched among millions of lines.
     let content = format!(
-        "filesync diff — comparing {src_disp} -> {dst_disp}\n\n{rendered_diff}{}",
+        "filesync diff — comparing source: {src_disp}   with   destination: {dst_disp}\n\
+         \n\
+         legend — what a sync would do. Each keyword below also titles its section in this file:\n\
+         search for the keyword to jump there.\n\
+         \x20 MARKER_MOVE (~)     rename within the destination: content that is already there is\n\
+         \x20                     relocated to match the source's layout — no data is transferred\n\
+         \x20 MARKER_COPY (+)     copy from the source to the destination: missing there (new file)\n\
+         \x20 MARKER_DELETE (-)   delete from the destination: absent from the source\n\
+         \x20                     (--backup-dir moves these aside instead of erasing)\n\
+         \x20 MARKER_UPDATE (*)   replace at the destination: same path but different content — it\n\
+         \x20                     is overwritten by a fresh copy from the source (atomically;\n\
+         \x20                     --backup-dir keeps the old version)\n\
+         \x20 MARKER_LINK (&)     hard-link at the destination: an extra name for content already\n\
+         \x20                     present there — the name is pointed at the local file (its\n\
+         \x20                     \"leader\"), nothing is copied; if the destination filesystem\n\
+         \x20                     cannot hold hard links, it becomes an independent copy instead\n\
+         \x20 MARKER_REFRESH (≈)  metadata-only: content identical, mtime/permissions realigned —\n\
+         \x20                     no data is transferred\n\
+         \x20 MARKER_SAME (=)     identical on both sides — nothing to do (listed only with\n\
+         \x20                     --include-same)\n\
+         \n{rendered_diff}{}",
         audit_block(audit)
     );
     super::write_diag(path, &content, "findings")
@@ -223,13 +246,35 @@ impl crate::diff::Diff {
         use crate::manifest::Kind;
         use std::fmt::Write;
         let mut s = String::new();
-        let _ = writeln!(s, "moved:     {}", self.moved.len());
+        // In the findings file (detail), every section title starts with its legend keyword —
+        // MARKER_MOVE (~) etc. — so the legend works as a table of contents (search the keyword to
+        // jump among millions of lines). The terminal summary has no such problem and stays
+        // compact, with the one high-risk clarification (the moved arrow's direction) inline.
+        // Segments whose ENTRIES use an arrow additionally open with a syntax note: what `A -> B`
+        // means on the lines below — distinct from the legend, which says what will be DONE.
+
         if detail {
+            let _ = writeln!(s, "MARKER_MOVE (~)  moved:     {}", self.moved.len());
+            if !self.moved.is_empty() {
+                let _ = writeln!(
+                    s,
+                    "    (each entry: relocation from <destination>/<existing-file>  ->  \
+                     <destination>/<future-file>)"
+                );
+            }
             for m in &self.moved {
                 let _ = writeln!(s, "    ~ {}  ->  {}", m.from.display(), m.to.display());
             }
+        } else {
+            let _ = writeln!(
+                s,
+                "moved:     {} (renames inside the destination: current path -> new path)",
+                self.moved.len()
+            );
         }
-        let _ = writeln!(s, "to copy:   {}", self.added.len());
+
+        let copy_title = if detail { "MARKER_COPY (+)  to copy:   " } else { "to copy:   " };
+        let _ = writeln!(s, "{copy_title}{}", self.added.len());
         if detail {
             for c in &self.added {
                 if c.kind == Kind::Other {
@@ -239,31 +284,69 @@ impl crate::diff::Diff {
                 }
             }
         }
-        let _ = writeln!(s, "to delete: {}", self.removed.len());
+
+        let del_title = if detail { "MARKER_DELETE (-)  to delete: " } else { "to delete: " };
+        let _ = writeln!(s, "{del_title}{}", self.removed.len());
         if detail {
             for c in &self.removed {
                 let _ = writeln!(s, "    - {}", c.rel.display());
             }
         }
-        let _ = writeln!(s, "to update: {}", self.changed.len());
+
+        let upd_title = if detail { "MARKER_UPDATE (*)  to update: " } else { "to update: " };
+        let _ = writeln!(s, "{upd_title}{}", self.changed.len());
         if detail {
             for c in &self.changed {
                 let _ = writeln!(s, "    * {}", c.rel.display());
             }
         }
-        let _ = writeln!(s, "to link:   {} (hard links — content written once via the leader)", self.to_link.len());
+
+        // extra names vs. the distinct files they point at — the gap is the dedup structure
+        // (e.g. "19368 for 4200 files" = on average ~5 names per inode)
+        let link_targets: std::collections::HashSet<&std::path::Path> =
+            self.to_link.iter().map(|l| l.leader.as_path()).collect();
         if detail {
+            let _ = writeln!(
+                s,
+                "MARKER_LINK (&)  to link:   {} (extra hard-link names for {} distinct file(s))",
+                self.to_link.len(),
+                link_targets.len()
+            );
+            if !self.to_link.is_empty() {
+                let _ = writeln!(
+                    s,
+                    "    (each entry: <destination>/<extra-name>  ->  <destination>/<leader-file> \
+                     it will be linked to)"
+                );
+            }
             for l in &self.to_link {
                 let _ = writeln!(s, "    & {}  ->  {}", l.name.display(), l.leader.display());
             }
+        } else {
+            let _ = writeln!(
+                s,
+                "to link:   {} (extra hard-link names for {} distinct file(s) — content written \
+                 once via the leader)",
+                self.to_link.len(),
+                link_targets.len()
+            );
         }
-        let _ = writeln!(s, "to refresh (content identical, metadata drift): {}", self.touched.len());
+
         if detail {
+            let _ = writeln!(s, "MARKER_REFRESH (≈)  to refresh: {}", self.touched.len());
             for c in &self.touched {
                 let _ = writeln!(s, "    ≈ {}", c.rel.display());
             }
+        } else {
+            let _ = writeln!(
+                s,
+                "to refresh (content identical, metadata drift): {}",
+                self.touched.len()
+            );
         }
-        let _ = writeln!(s, "unchanged: {}", self.unchanged);
+
+        let same_title = if detail { "MARKER_SAME (=)  unchanged: " } else { "unchanged: " };
+        let _ = writeln!(s, "{same_title}{}", self.unchanged);
         if detail {
             // Only ever populated under --include-same; listed here so the exhaustive findings
             // account for every entry, not just the ones that change.
@@ -344,6 +427,45 @@ mod tests {
             rep.contains("recorded in dirty.errors.txt"),
             "report must point at the errors file:\n{rep}"
         );
+    }
+
+    #[test]
+    fn diff_findings_carry_the_marker_legend_as_a_table_of_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f.findings.txt");
+        // a real (empty) diff body, so section titles are present — the ToC property is that each
+        // keyword appears BOTH in the legend and as its section's title
+        let body = crate::diff::Diff::default().render(true);
+        assert!(write_diff(&path, "/src", "/dst", &body, &[]));
+        let content = std::fs::read_to_string(&path).unwrap();
+
+        // the header must NOT share the entries' `A -> B` syntax
+        assert!(
+            content.contains("comparing source: /src   with   destination: /dst"),
+            "{content}"
+        );
+        assert!(!content.contains("comparing /src -> /dst"), "old arrow header is gone");
+        // the legend explains itself as a lookup table…
+        assert!(content.contains("search for the keyword"), "{content}");
+        // …explains the actions (the two the user specifically asked about)…
+        assert!(content.contains("overwritten by a fresh copy"), "update = replacement:\n{content}");
+        assert!(
+            content.contains("pointed at the local file"),
+            "link = pointed onto the local drive:\n{content}"
+        );
+        // …and every keyword occurs at least twice: once in the legend, once as a section title
+        for keyword in [
+            "MARKER_MOVE (~)",
+            "MARKER_COPY (+)",
+            "MARKER_DELETE (-)",
+            "MARKER_UPDATE (*)",
+            "MARKER_LINK (&)",
+            "MARKER_REFRESH (≈)",
+            "MARKER_SAME (=)",
+        ] {
+            let n = content.matches(keyword).count();
+            assert!(n >= 2, "{keyword} must be in legend AND title a section (found {n}):\n{content}");
+        }
     }
 
     #[test]

@@ -60,6 +60,35 @@ fn parallel_move_detection_matches_sequential() {
     assert!(r.added.is_empty() && r.removed.is_empty(), "a move is neither an add nor a delete");
 }
 
+#[cfg(unix)]
+#[test]
+fn to_link_line_counts_names_and_distinct_targets() {
+    // three names for ONE inode: the leader carries the content; the two followers are "to link".
+    // The summary line must show both numbers — 2 extra names, 1 distinct file — so a huge link
+    // count is immediately readable as "how many names for how many files".
+    let (s, d) = dirs();
+    common::file(s.path(), "a_leader.bin", b"SHARED-INODE-CONTENT");
+    std::fs::hard_link(s.path().join("a_leader.bin"), s.path().join("b_follower.bin")).unwrap();
+    std::fs::hard_link(s.path().join("a_leader.bin"), s.path().join("c_follower.bin")).unwrap();
+
+    let r = run_diff(s.path(), d.path(), false);
+    assert_eq!(r.to_link.len(), 2, "two follower names");
+    let line_present = r
+        .render(false)
+        .contains("to link:   2 (extra hard-link names for 1 distinct file(s)");
+    assert!(line_present, "summary shows names AND distinct targets:\n{}", r.render(false));
+    // in the findings file the segment is keyword-titled and explains its arrow syntax
+    let detail = r.render(true);
+    assert!(
+        detail.contains("MARKER_LINK (&)  to link:   2 (extra hard-link names for 1 distinct file(s))"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("<destination>/<extra-name>"),
+        "the link segment must explain its arrow syntax:\n{detail}"
+    );
+}
+
 #[test]
 fn include_same_collects_and_lists_identical_files_only_on_demand() {
     let (s, d) = dirs();
@@ -163,6 +192,63 @@ fn empty_files_are_not_move_matched() {
     assert!(r.moved.is_empty(), "empty files must not be paired as a move");
     assert_eq!(r.added_paths(), vec![PathBuf::from("empty_new")], "the empty add stays an add");
     assert_eq!(r.removed_paths(), vec![PathBuf::from("empty_old")], "the empty remove stays a delete");
+}
+
+/// THE direction pin, at both levels (struct and rendered line): a move's `from` is the
+/// DESTINATION's current path, its `to` is the path in the SOURCE — the rename happens entirely
+/// inside the destination, mirroring the source's layout. (A findings line therefore reads
+/// `~ <dest's old path>  ->  <its new path>`; the source is never touched — see also the sync
+/// tests `move_executes_as_rename_preserving_inode` and `sync_does_not_modify_the_source`.)
+#[test]
+fn move_direction_is_destinations_old_path_to_sources_new_path() {
+    let (s, d) = dirs();
+    common::file(s.path(), "where_source_has_it.bin", b"IDENTICAL-PAYLOAD");
+    common::file(d.path(), "where_dest_still_has_it.bin", b"IDENTICAL-PAYLOAD");
+    let r = run_diff(s.path(), d.path(), false);
+    assert_eq!(
+        r.moved,
+        vec![Move {
+            from: PathBuf::from("where_dest_still_has_it.bin"), // dest's CURRENT path
+            to: PathBuf::from("where_source_has_it.bin"),       // its NEW path (source's layout)
+        }]
+    );
+    let rendered = r.render(true);
+    assert!(
+        rendered.contains("~ where_dest_still_has_it.bin  ->  where_source_has_it.bin"),
+        "rendered arrow must read dest-old -> new:\n{rendered}"
+    );
+    // the findings file opens the segment with the entry-syntax note (what `->` means HERE)…
+    assert!(
+        rendered.contains("relocation from <destination>/<existing-file>"),
+        "the moved segment must explain its arrow syntax:\n{rendered}"
+    );
+    // …while the compact terminal summary carries the inline clarification instead
+    assert!(
+        r.render(false).contains("renames inside the destination"),
+        "terminal summary keeps the direction clarification:\n{}",
+        r.render(false)
+    );
+}
+
+/// Duplicate content, MORE extras than adds: each destination file may be consumed by at most one
+/// move (hash→queue, popped once); the unmatched extra stays a plain delete — never a second move
+/// pointing at an already-consumed file.
+#[test]
+fn more_removes_than_matching_adds_yields_move_plus_delete() {
+    let (s, d) = dirs();
+    common::file(s.path(), "p.txt", b"SAME"); // one add...
+    common::file(d.path(), "q1.txt", b"SAME"); // ...two identical extras
+    common::file(d.path(), "q2.txt", b"SAME");
+    let r = run_diff(s.path(), d.path(), false);
+    assert_eq!(r.moved.len(), 1, "exactly one pairing");
+    assert_eq!(r.removed.len(), 1, "the unmatched extra stays a delete");
+    let consumed = &r.moved[0].from;
+    let deleted = &r.removed[0].rel;
+    assert_ne!(consumed, deleted, "no destination file is pointed at twice");
+    assert!(
+        [consumed, deleted].iter().all(|p| **p == PathBuf::from("q1.txt") || **p == PathBuf::from("q2.txt")),
+        "both extras accounted for, once each"
+    );
 }
 
 #[test]

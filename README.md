@@ -124,7 +124,10 @@ stderr — into files plus the terminal. The files share one timestamped stem:
 
 - The **findings** file is the report. `sync` records what it did (the counts, plus any benign
   skips); `diff` writes the full new/changed/moved/deleted listing — however large — and prints only
-  a compact count summary to the screen. By default `diff` omits content-identical files (they're
+  a compact count summary to the screen. The diff findings open with a **marker legend** that
+  doubles as a table of contents: each `MARKER_*` keyword explains its action *and* titles its
+  section, so you can search it to jump there; segments whose entries use `->` also state what the
+  arrow means right where the lines are. By default `diff` omits content-identical files (they're
   counted, not listed); `--include-same` lists them too.
 - The **`.errors.txt`** companion holds anything needing your attention, one issue per line, each
   labeled with its side (`source:` / `destination:`). It's created **only if there's at least one
