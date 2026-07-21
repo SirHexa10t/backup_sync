@@ -351,6 +351,40 @@ landed between the same pair of runs, so the halving is their combined effect �
 consistent with expectation: overlapping two independent drives approaches 2×, and dropping
 thousands of pointless empty-file opens compounds it.
 
+### Move-detection vs plain copy for SMALL files — measured, and detection wins
+
+A natural follow-up suspicion: for *small* files, is hashing both sides even worth it, or would
+plain copy+delete be faster? Benchmarked end-to-end (harness: `benchmarks/make_move_bench.sh` +
+`run_move_bench.sh`): 100,000 files of 1–8 KiB random content (421 MiB) renamed wholesale at the
+destination — the pure-move workload — synced under both strategies, interleaved A/B/A/B, two
+rounds per arm, on the same external device through two different-speed ports. Timed by the
+harness (wall-clock per command; caches cooled before every run):
+
+| per sync of 100k small files (4 runs each) | average |
+|--------------------------------------------|---------|
+| baseline (hash both sides + rename)        | **42.0 s** (39.97–44.10) |
+| skip-detection (copy + verify + delete)    | **105.2 s** (94.57–110.30) |
+
+**Skipping makes the sync 2.5× slower.** The decomposition is internally exact: hashing all
+200k files (842 MiB, two drives overlapped) costs ~33 s; executing 100k renames costs ~8 s;
+executing 100k copies + cold verify + deletes costs ~104 s — so skipping saves 33 s of hashing to
+buy ~96 s of extra apply (−33 + 96 = +63 s, matching the measured gap exactly). A standalone
+`diff` shows the same split: ~35 s with hashing vs ~1.2 s without — the work isn't avoided, only
+postponed into sync's copies. Two corroborating details: both arms are *port-invariant* (at these
+file sizes per-file overhead dominates, not cable bandwidth; renames are pure metadata), and
+skipping wrote 421 MiB + verify-read 421 MiB where the baseline wrote **zero bytes** (finding 3:
+writes wear flash).
+
+**Break-even:** hashing costs ~0.33 ms per small candidate pair; a match saves ~0.96 ms of
+copy+verify+delete. So move-detection pays for itself whenever more than roughly **1 in 3**
+size-matched small candidates is a true move — a bar reorganization-driven backups clear easily
+(this workload was 100% moves; the loss case would need mismatch-dominated trees).
+**Decision: no minimum-size threshold; move-detection stays on for every non-empty size.** (The
+size-0 exclusion above stands on its own logic: *every* empty file collides, a match is
+meaningless, and a zero-byte copy costs the same as a rename.) Were a threshold ever revisited for
+a mismatch-dominated workload, note that the deletion-suspension safety for unreadable source
+files currently piggybacks on move-candidate hashing — it would need an independent trigger first.
+
 ### The fix: one fs-sync, not N per-file fsyncs
 
 This resolves the discrepancy the plan already implied: the barrier looped `sync_all` per copied
